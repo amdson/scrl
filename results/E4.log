@@ -1,0 +1,103 @@
+[E4/TDA_N10000_s0] Maze(open7: 7x7, d*=7, T=20, K=22, door=-1, p_locked=0.0) params=110,238 data N=9982 (solve 0.094, optimal 0.0000) L=41
+  eval@0: value_err mean=0.9181 max=0.9838 opt_err=1.000 cons=0.465 piR_err=0.488
+  eval@250: value_err mean=0.0620 max=0.0815 opt_err=0.670 cons=0.321 piR_err=0.161
+  eval@500: value_err mean=0.0459 max=0.0687 opt_err=0.655 cons=0.265 piR_err=0.146
+  step 500: a=1.390 a_wmean=0.947 grad_norm=0.877 mc=0.421 pi=1.388 piR=1.377 td=0.413 term=0.004 total=3.181 (151 ms/step)
+  eval@750: value_err mean=0.0386 max=0.0603 opt_err=0.668 cons=0.178 piR_err=0.153
+  eval@1000: value_err mean=0.0344 max=0.0515 opt_err=0.720 cons=0.159 piR_err=0.154
+  step 1000: a=1.227 a_wmean=0.929 grad_norm=0.899 mc=0.361 pi=1.389 piR=1.377 td=0.405 term=0.002 total=4.399 (140 ms/step)
+  eval@1250: value_err mean=0.0301 max=0.0451 opt_err=0.692 cons=0.169 piR_err=0.133
+  eval@1500: value_err mean=0.0306 max=0.0461 opt_err=0.744 cons=0.167 piR_err=0.143
+  step 1500: a=1.204 a_wmean=0.929 grad_norm=0.850 mc=0.353 pi=1.386 piR=1.373 td=0.373 term=0.001 total=4.337 (140 ms/step)
+  eval@1750: value_err mean=0.0301 max=0.0452 opt_err=0.678 cons=0.177 piR_err=0.131
+  eval@2000: value_err mean=0.0284 max=0.0410 opt_err=0.711 cons=0.165 piR_err=0.127
+  step 2000: a=1.196 a_wmean=0.927 grad_norm=0.988 mc=0.368 pi=1.386 piR=1.371 td=0.363 term=0.001 total=4.317 (144 ms/step)
+  eval@2250: value_err mean=0.0279 max=0.0418 opt_err=0.690 cons=0.184 piR_err=0.120
+  eval@2500: value_err mean=0.0260 max=0.0399 opt_err=0.736 cons=0.174 piR_err=0.123
+  step 2500: a=1.203 a_wmean=0.942 grad_norm=0.842 mc=0.387 pi=1.384 piR=1.367 td=0.389 term=0.001 total=4.344 (151 ms/step)
+  eval@2750: value_err mean=0.0266 max=0.0407 opt_err=0.765 cons=0.183 piR_err=0.122
+  eval@3000: value_err mean=0.0261 max=0.0400 opt_err=0.789 cons=0.178 piR_err=0.123 | piR_sample:0.73/0.00 piR_greedy:1.00/0.00 posterior:0.79/0.02 posterior_greedy:1.00/0.00 ev_b1:0.58/0.05 ev_b3:0.91/0.17 ev_b10:1.00/0.51
+[E4/TDA_N10000_s0] done in 589s
+[E4/FQI_N10000_s0] Maze(open7: 7x7, d*=7, T=20, K=22, door=-1, p_locked=0.0) params=110,238 data N=9982 (solve 0.094, optimal 0.0000) L=41
+  eval@0: value_err mean=0.9181 max=0.9838 opt_err=1.000 cons=0.465 piR_err=0.488 q_err=5.580 overest=5.580
+  eval@250: value_err mean=0.8910 max=0.9520 opt_err=0.940 cons=0.353 piR_err=0.512 q_err=4.618 overest=4.612
+  eval@500: value_err mean=0.8940 max=0.9523 opt_err=0.886 cons=0.381 piR_err=0.490 q_err=4.715 overest=4.710
+  step 500: fqi=0.025 grad_norm=0.504 q_mean=-0.243 total=0.025 (102 ms/step)
+  eval@750: value_err mean=0.8919 max=0.9584 opt_err=1.014 cons=0.335 piR_err=0.518 q_err=3.844 overest=3.814
+  eval@1000: value_err mean=0.8947 max=0.9626 opt_err=0.992 cons=0.364 piR_err=0.513 q_err=3.840 overest=3.813
+  step 1000: fqi=0.015 grad_norm=0.224 q_mean=-1.050 total=0.015 (87 ms/step)
+  eval@1250: value_err mean=0.8785 max=0.9630 opt_err=1.008 cons=0.425 piR_err=0.454 q_err=3.090 overest=2.943
+  eval@1500: value_err mean=0.8818 max=0.9632 opt_err=0.971 cons=0.431 piR_err=0.441 q_err=3.086 overest=2.953
+  step 1500: fqi=0.012 grad_norm=0.186 q_mean=-1.890 total=0.012 (84 ms/step)
+  eval@1750: value_err mean=0.8772 max=0.9645 opt_err=1.130 cons=0.457 piR_err=0.543 q_err=2.401 overest=2.110
+  eval@2000: value_err mean=0.8781 max=0.9633 opt_err=1.111 cons=0.460 piR_err=0.529 q_err=2.397 overest=2.115
+  step 2000: fqi=0.012 grad_norm=0.157 q_mean=-2.723 total=0.012 (143 ms/step)
+  eval@2250: value_err mean=0.8699 max=0.9639 opt_err=1.045 cons=0.461 piR_err=0.473 q_err=1.745 overest=1.389
+  eval@2500: value_err mean=0.8724 max=0.9646 opt_err=1.036 cons=0.460 piR_err=0.470 q_err=1.739 overest=1.400
+  step 2500: fqi=0.012 grad_norm=0.150 q_mean=-3.507 total=0.012 (131 ms/step)
+  eval@2750: value_err mean=0.8830 max=0.9600 opt_err=1.021 cons=0.443 piR_err=0.433 q_err=1.206 overest=0.825
+  eval@3000: value_err mean=0.8841 max=0.9615 opt_err=1.029 cons=0.445 piR_err=0.434 q_err=1.198 overest=0.812 | piR_sample:0.00/0.00 piR_greedy:0.00/0.00 posterior:0.01/0.00 posterior_greedy:0.00/0.00 ev_b1:0.00/0.00 ev_b3:0.00/0.00 ev_b10:0.00/0.00 fqi_greedy:1.00/0.00
+[E4/FQI_N10000_s0] done in 464s
+  tabular FQI it=0 delta=2.0000 q_err=3.875 overest=3.875
+  tabular FQI it=50 delta=0.0000 q_err=0.097 overest=0.097
+  tabular FQI it=100 delta=0.0000 q_err=0.097 overest=0.097
+  tabular FQI it=150 delta=0.0000 q_err=0.097 overest=0.097
+[E4/TDA_N10000_s1] Maze(open7: 7x7, d*=7, T=20, K=22, door=-1, p_locked=0.0) params=110,238 data N=9979 (solve 0.095, optimal 0.0000) L=41
+  eval@0: value_err mean=0.7944 max=0.9025 opt_err=2.139 cons=0.577 piR_err=0.913
+  eval@250: value_err mean=0.0554 max=0.0772 opt_err=0.696 cons=0.319 piR_err=0.181
+  eval@500: value_err mean=0.0425 max=0.0651 opt_err=0.674 cons=0.301 piR_err=0.156
+  step 500: a=1.360 a_wmean=0.950 grad_norm=0.813 mc=0.417 pi=1.388 piR=1.376 td=0.411 term=0.004 total=3.179 (199 ms/step)
+  eval@750: value_err mean=0.0355 max=0.0600 opt_err=0.771 cons=0.217 piR_err=0.179
+  eval@1000: value_err mean=0.0381 max=0.0550 opt_err=0.786 cons=0.195 piR_err=0.169
+  step 1000: a=1.223 a_wmean=0.935 grad_norm=0.905 mc=0.362 pi=1.387 piR=1.376 td=0.342 term=0.002 total=4.330 (194 ms/step)
+  eval@1250: value_err mean=0.0338 max=0.0522 opt_err=0.800 cons=0.186 piR_err=0.150
+  eval@1500: value_err mean=0.0297 max=0.0479 opt_err=0.757 cons=0.196 piR_err=0.148
+  step 1500: a=1.196 a_wmean=0.922 grad_norm=0.903 mc=0.375 pi=1.386 piR=1.371 td=0.428 term=0.001 total=4.382 (195 ms/step)
+  eval@1750: value_err mean=0.0283 max=0.0456 opt_err=0.820 cons=0.184 piR_err=0.141
+  eval@2000: value_err mean=0.0274 max=0.0414 opt_err=0.835 cons=0.189 piR_err=0.131
+  step 2000: a=1.188 a_wmean=0.925 grad_norm=0.846 mc=0.362 pi=1.385 piR=1.368 td=0.385 term=0.001 total=4.327 (193 ms/step)
+  eval@2250: value_err mean=0.0295 max=0.0467 opt_err=0.891 cons=0.183 piR_err=0.139
+  eval@2500: value_err mean=0.0270 max=0.0418 opt_err=0.867 cons=0.192 piR_err=0.134
+  step 2500: a=1.186 a_wmean=0.927 grad_norm=0.862 mc=0.343 pi=1.384 piR=1.368 td=0.357 term=0.001 total=4.296 (193 ms/step)
+  eval@2750: value_err mean=0.0257 max=0.0400 opt_err=0.855 cons=0.193 piR_err=0.129
+  eval@3000: value_err mean=0.0259 max=0.0410 opt_err=0.827 cons=0.189 piR_err=0.130 | piR_sample:0.75/0.00 piR_greedy:1.00/0.00 posterior:0.79/0.01 posterior_greedy:1.00/0.00 ev_b1:0.62/0.04 ev_b3:0.96/0.18 ev_b10:1.00/0.66
+[E4/TDA_N10000_s1] done in 670s
+[E4/FQI_N10000_s1] Maze(open7: 7x7, d*=7, T=20, K=22, door=-1, p_locked=0.0) params=110,238 data N=9979 (solve 0.095, optimal 0.0000) L=41
+  eval@0: value_err mean=0.7944 max=0.9025 opt_err=2.139 cons=0.577 piR_err=0.913 q_err=5.422 overest=5.422
+  eval@250: value_err mean=0.7972 max=0.8863 opt_err=1.795 cons=0.430 piR_err=0.789 q_err=4.554 overest=4.546
+  eval@500: value_err mean=0.7914 max=0.8849 opt_err=1.758 cons=0.446 piR_err=0.727 q_err=4.584 overest=4.577
+  step 500: fqi=0.020 grad_norm=0.394 q_mean=-0.355 total=0.020 (117 ms/step)
+  eval@750: value_err mean=0.8022 max=0.8762 opt_err=1.343 cons=0.278 piR_err=0.651 q_err=3.683 overest=3.619
+  eval@1000: value_err mean=0.8049 max=0.8795 opt_err=1.340 cons=0.290 piR_err=0.649 q_err=3.695 overest=3.639
+  step 1000: fqi=0.014 grad_norm=0.186 q_mean=-1.165 total=0.014 (113 ms/step)
+  eval@1250: value_err mean=0.7748 max=0.8585 opt_err=1.369 cons=0.282 piR_err=0.636 q_err=2.921 overest=2.719
+  eval@1500: value_err mean=0.7734 max=0.8562 opt_err=1.402 cons=0.290 piR_err=0.630 q_err=2.913 overest=2.732
+  step 1500: fqi=0.012 grad_norm=0.147 q_mean=-2.044 total=0.012 (106 ms/step)
+  eval@1750: value_err mean=0.8121 max=0.9254 opt_err=1.141 cons=0.339 piR_err=0.500 q_err=2.167 overest=1.936
+  eval@2000: value_err mean=0.8148 max=0.9238 opt_err=1.152 cons=0.331 piR_err=0.506 q_err=2.163 overest=1.932
+  step 2000: fqi=0.012 grad_norm=0.127 q_mean=-2.911 total=0.012 (105 ms/step)
+  eval@2250: value_err mean=0.8242 max=0.9270 opt_err=0.789 cons=0.299 piR_err=0.381 q_err=1.510 overest=1.242
+  eval@2500: value_err mean=0.8264 max=0.9313 opt_err=0.803 cons=0.303 piR_err=0.389 q_err=1.506 overest=1.240
+  step 2500: fqi=0.012 grad_norm=0.129 q_mean=-3.711 total=0.012 (103 ms/step)
+  eval@2750: value_err mean=0.8281 max=0.9425 opt_err=0.787 cons=0.329 piR_err=0.358 q_err=0.955 overest=0.645
+  eval@3000: value_err mean=0.8244 max=0.9407 opt_err=0.813 cons=0.332 piR_err=0.368 q_err=0.952 overest=0.634 | piR_sample:0.53/0.01 piR_greedy:1.00/0.00 posterior:0.41/0.01 posterior_greedy:0.00/0.00 ev_b1:0.32/0.01 ev_b3:0.17/0.00 ev_b10:0.01/0.00 fqi_greedy:1.00/0.00
+[E4/FQI_N10000_s1] done in 407s
+  tabular FQI it=0 delta=2.0000 q_err=3.875 overest=3.875
+  tabular FQI it=50 delta=0.0000 q_err=0.097 overest=0.097
+  tabular FQI it=100 delta=0.0000 q_err=0.097 overest=0.097
+  tabular FQI it=150 delta=0.0000 q_err=0.097 overest=0.097
+[E4/TDA_N10000_s2] Maze(open7: 7x7, d*=7, T=20, K=22, door=-1, p_locked=0.0) params=110,238 data N=9982 (solve 0.098, optimal 0.0000) L=41
+  eval@0: value_err mean=0.9022 max=0.9532 opt_err=0.895 cons=0.486 piR_err=0.491
+  eval@250: value_err mean=0.0590 max=0.0792 opt_err=0.638 cons=0.282 piR_err=0.193
+  eval@500: value_err mean=0.0449 max=0.0640 opt_err=0.514 cons=0.257 piR_err=0.157
+  step 500: a=1.365 a_wmean=0.961 grad_norm=0.799 mc=0.398 pi=1.388 piR=1.378 td=0.431 term=0.003 total=3.200 (212 ms/step)
+  eval@750: value_err mean=0.0399 max=0.0540 opt_err=0.719 cons=0.194 piR_err=0.170
+  eval@1000: value_err mean=0.0331 max=0.0484 opt_err=0.771 cons=0.186 piR_err=0.152
+  step 1000: a=1.243 a_wmean=0.945 grad_norm=1.123 mc=0.404 pi=1.390 piR=1.378 td=0.459 term=0.002 total=4.472 (202 ms/step)
+  eval@1250: value_err mean=0.0423 max=0.0636 opt_err=0.820 cons=0.158 piR_err=0.166
+  eval@1500: value_err mean=0.0317 max=0.0461 opt_err=0.801 cons=0.174 piR_err=0.148
+  step 1500: a=1.213 a_wmean=0.928 grad_norm=0.974 mc=0.352 pi=1.388 piR=1.376 td=0.433 term=0.001 total=4.411 (201 ms/step)
+  eval@1750: value_err mean=0.0385 max=0.0612 opt_err=0.810 cons=0.166 piR_err=0.140
+  eval@2000: value_err mean=0.0294 max=0.0464 opt_err=0.796 cons=0.171 piR_err=0.132
+  step 2000: a=1.200 a_wmean=0.926 grad_norm=0.854 mc=0.385 pi=1.386 piR=1.371 td=0.441 term=0.001 total=4.399 (199 ms/step)
+  eval@2250: value_err mean=0.0268 max=0.0418 opt_err=0.816 cons=0.189 piR_err=0.134

@@ -1,0 +1,51 @@
+{
+ "random": {
+  "solve_rate": 0.101,
+  "mean_steps": 11.400990099009901,
+  "mean_return": -15.5355,
+  "optimal_rate": 0.00125,
+  "door_choice": 0.586
+ },
+ "piR_star": {
+  "solve_rate": 0.35125,
+  "mean_steps": 5.192170818505338,
+  "mean_return": -12.20375,
+  "optimal_rate": 0.29925,
+  "door_choice": 1.0
+ },
+ "posterior": {
+  "solve_rate": 0.34425,
+  "mean_steps": 5.25199709513435,
+  "mean_return": -12.3,
+  "optimal_rate": 0.29,
+  "door_choice": 1.0
+ },
+ "greedy_opt": {
+  "solve_rate": 1.0,
+  "mean_steps": 6.0,
+  "mean_return": -6.0,
+  "optimal_rate": 0.0,
+  "door_choice": 0.0
+ },
+ "ev_b1": {
+  "solve_rate": 0.52325,
+  "mean_steps": 8.22360248447205,
+  "mean_return": -11.931,
+  "optimal_rate": 0.02775,
+  "door_choice": 0.5005
+ },
+ "ev_b3": {
+  "solve_rate": 0.88525,
+  "mean_steps": 7.212369387178763,
+  "mean_return": -8.22075,
+  "optimal_rate": 0.06,
+  "door_choice": 0.433
+ },
+ "ev_b10": {
+  "solve_rate": 0.999,
+  "mean_steps": 6.1974474474474475,
+  "mean_return": -6.20725,
+  "optimal_rate": 0.2225,
+  "door_choice": 0.788
+ }
+}
