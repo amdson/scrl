@@ -5,7 +5,7 @@
 A single causal transformer over `[R-or-NOR] [grid] (a_1, pos_1) (a_2, pos_2) ...` with three readouts:
 
 - `pi(a_t | prefix)`            — next-action head, NOR mode
-- `V_t(R | prefix)`             — categorical reward head at every step, NOR mode
+- `V_t(R | prefix)`             — categorical reward head at every step
 - `pi_R(a_t | prefix, R)`       — next-action head, R mode (R token as prefix)
 
 Consistency identities (fixed token order, R floats):
@@ -15,19 +15,6 @@ Consistency identities (fixed token order, R floats):
 (B)  V_{t-1}(R|s)               =  sum_a pi(a|s) V_t(R|s,a)        (marginal of A)
 ```
 
-Hypotheses, in the order they should be killed:
-
-| ID | Claim | Kill criterion |
-|----|-------|----------------|
-| H1 | TD via (B) gives lower early-t value error than MC regression on random-walk data | TD curve not below MC curve for t < T/2 at any data size |
-| H2 | (A) recovers the optimal policy (uniform over shortest paths) at R = -d*, a value never observed in data | KL(pi_R* ‖ pi_R) at R=-d* not < 0.1 nats averaged over states |
-| H3 | Posterior tilt gambles, expected-value tilt doesn't, from the same heads | Both tilts pick the same route on the locked-door maze |
-| H4 | Value error grows linearly in horizon and does not diverge; FQI on the same data does worse | Error curve superlinear, or FQI matches it |
-| H5 | Each loop closure (off-policy q, pi <- pi_R, pi_R in backup) degrades H4 in the predicted order | No ordering visible |
-
-Everything below is sized so E1–E4 run on one GPU (or a laptop CPU at reduced N) in under a day total.
-
----
 
 ## 1. Environment
 
