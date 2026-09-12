@@ -23,9 +23,12 @@ CONFIGS = {
     "base": LossConfig(),                    # next-token loss only (NOR + R teacher forcing)
     "mc":   LossConfig(mc=True),             # + Monte Carlo value
     "td":   LossConfig(td=True),             # + TD value, identity (B)
-    "mc_a": LossConfig(mc=True, a=True),     # + Monte Carlo value + identity (A)
-    "td_a": LossConfig(td=True, a=True),     # + TD value + identity (A): the full method
+    "mc_a4": LossConfig(mc=True, a=True),    # + Monte Carlo value + identity (A)
+    "td_a4": LossConfig(td=True, a=True),    # + TD value + identity (A): the full method
 }
+# "a4": A runs as its own steps, LossConfig.a_updates = 4 per training step on a_batch = 16 fresh rollouts each,
+# with a separate Adam at lr_a = 1e-4 (main loss: 1e-3). Earlier sweeps named mc_a / td_a put A inside the main
+# loss with 16 examples per step; their runs stay on disk and load_sweep still plots them.
 
 
 @dataclass(frozen=True)

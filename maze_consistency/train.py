@@ -1,13 +1,13 @@
 """Training on the canonical rollouts. Every batch is half NOR, half R mode (MODE = the rollout's own outcome
-bin) and always trains the teacher-forced next-token loss. LossConfig adds value and consistency terms, all on
-the NOR half of the batch:
+bin) and always trains the teacher-forced next-token loss. LossConfig adds value and consistency terms:
 
-  mc   Monte Carlo value:  CE( V_t , one-hot(outcome bin) ) at every state slot t <= L
+  mc   Monte Carlo value:  CE( V_t , one-hot(outcome bin) ) at every NOR state slot t <= L         (main step)
   td   identity (B):       CE( V_t , sg[ w_t * V_{t+1} ] ), w_t = pi(a_t | h_t) / (1/4) clipped at 4;
-                           the last step uses the known outcome
-  a    identity (A):       one random step t and bin k per sequence, explicit children from the maze table:
-                           CE( pi_R(. | h_t, k) , sg[ pi(a | h_t) V_{t+1}(k | h_t, a) / sum_a' ... ] ),
-                           switched on after a_warmup of training; skipped where the denominator is ~0
+                           the last step uses the known outcome                                      (main step)
+  a    identity (A):       CE( pi_R(. | h_t, k) , sg[ pi(a | h_t) V_{t+1}(k | h_t, a) / sum_a' ... ] ) for one
+                           random step t and bin k per rollout, children from the maze table. Runs as its own
+                           a_updates gradient steps per training step, each on a_batch fresh rollouts, with a
+                           separate Adam at lr_a; on after a_warmup of training; skipped where the denominator ~0.
 
 train() optionally calls eval_fn(params, fwd) every eval_every steps; the results go into history.json.
 """
@@ -41,12 +41,14 @@ class LossConfig:
     a: bool = False
     w_mc: float = 1.0
     w_td: float = 1.0
-    w_a: float = 1.0
-    a_warmup: float = 0.25    # fraction of training before the A loss switches on
+    a_updates: int = 4        # separate A gradient steps per training step
+    a_batch: int = 16         # fresh rollouts per A step (one state and one bin each)
+    lr_a: float = 1e-4        # A has its own Adam at this rate; the main loss uses train(lr=...)
+    a_warmup: float = 0.25    # fraction of training before the A steps start
 
     @property
-    def needs_value(self) -> bool:
-        return self.mc or self.td or self.a
+    def main_value(self) -> bool:
+        return self.mc or self.td
 
 
 def make_batch(tok: Tokenizer, maze, d, idx, p_nor=0.5):
@@ -58,14 +60,19 @@ def make_batch(tok: Tokenizer, maze, d, idx, p_nor=0.5):
     return x, tgt, mask
 
 
-def consistency_batch(tok: Tokenizer, maze, d, idx, x_nor, rng, lc: LossConfig):
-    """Host-side inputs for the value and A losses on NOR rows x_nor [n, L, 3]."""
+def value_batch(maze, d, idx):
+    """Host-side inputs for the MC / TD losses on the NOR rows of a batch."""
     L, reached = d["length"][idx].astype(np.int64), d["reached"][idx]
-    cb = dict(act=d["actions"][idx].astype(np.int32), L=L.astype(np.int32),
-              term_bin=maze.outcome_bin(L, reached).astype(np.int32))
-    if not lc.a:
-        return cb
+    return dict(act=d["actions"][idx].astype(np.int32), L=L.astype(np.int32),
+                term_bin=maze.outcome_bin(L, reached).astype(np.int32))
+
+
+def a_batch(tok: Tokenizer, maze, d, idx, rng):
+    """Host-side inputs for one A step: NOR prefixes, the same prefixes with MODE = a random bin k, and the four
+    children of one random state per rollout (terminal children are labelled analytically)."""
     n, T = len(idx), maze.T
+    L = d["length"][idx].astype(np.int64)
+    x_nor = tok.with_mode(tok.encode_body(d["positions"][idx], d["actions"][idx], L), None)
     t = (rng.random(n) * L).astype(np.int64)                       # one state per row, t < L
     k = rng.integers(0, maze.K, n)                                  # one outcome bin per row
     x_k = x_nor.copy()
@@ -78,26 +85,24 @@ def consistency_batch(tok: Tokenizer, maze, d, idx, x_nor, rng, lc: LossConfig):
         children[np.arange(n), a, si + 1] = tok.act(np.full(n, a))
         children[np.arange(n), a, si + 2] = tok.pos(nxt[:, a])
     goal = nxt == maze.goal
-    cb.update(t=t.astype(np.int32), k=k.astype(np.int32), x_k=x_k,
-              children=children.reshape(n * N_ACTIONS, tok.L, 3),
-              child_term=goal | ((t + 1) == T)[:, None],
-              child_term_bin=np.where(goal, maze.success_bin(t + 1)[:, None], maze.FAIL_BIN).astype(np.int32))
-    return cb
+    return dict(x_nor=x_nor, x_k=x_k, t=t.astype(np.int32), k=k.astype(np.int32),
+                children=children.reshape(n * N_ACTIONS, tok.L, 3),
+                child_term=goal | ((t + 1) == T)[:, None],
+                child_term_bin=np.where(goal, maze.success_bin(t + 1)[:, None], maze.FAIL_BIN).astype(np.int32))
 
 
 def make_step(model, tok: Tokenizer, opt, lc: LossConfig):
+    """Main step: next-token loss plus the MC / TD value terms on the NOR half."""
     types, sidx = jnp.asarray(tok.types), jnp.asarray(tok.sidx)
     T, K = tok.T, tok.K
 
-    def loss_fn(p, x, tgt, mask, cb, a_on):
-        apply = lambda z: model.apply({"params": p}, z, types)
-        out = apply(x)
+    def loss_fn(p, x, tgt, mask, cb):
+        out = model.apply({"params": p}, x, types)
         tf = next_token_loss(out["next"], tgt, mask)
         total, parts = tf, dict(tf=tf)
-        if not lc.needs_value:
+        if not lc.main_value:
             return total, parts
         n = cb["L"].shape[0]
-        logpi = jax.nn.log_softmax(out["next"][:n][:, sidx, :N_ACTIONS], -1)      # [n, T+1, 4]
         logV = jax.nn.log_softmax(out["value"][:n][:, sidx], -1)                   # [n, T+1, K]
         if lc.mc:
             valid_s = jnp.arange(T + 1)[None] <= cb["L"][:, None]
@@ -105,8 +110,9 @@ def make_step(model, tok: Tokenizer, opt, lc: LossConfig):
             mc = (mc * valid_s).sum() / valid_s.sum()
             total, parts["mc"] = total + lc.w_mc * mc, mc
         if lc.td:
+            logpi = jax.nn.log_softmax(out["next"][:n][:, sidx[:T], :N_ACTIONS], -1)
             valid = jnp.arange(T)[None] < cb["L"][:, None]
-            lp_a = jnp.take_along_axis(logpi[:, :T], cb["act"][..., None], -1)[..., 0]
+            lp_a = jnp.take_along_axis(logpi, cb["act"][..., None], -1)[..., 0]
             w = jnp.clip(jnp.exp(sg(lp_a)) * N_ACTIONS, 0.0, 4.0)
             v_next = sg(jnp.exp(logV[:, 1:]))
             last = (jnp.arange(T)[None] + 1) == cb["L"][:, None]
@@ -114,29 +120,45 @@ def make_step(model, tok: Tokenizer, opt, lc: LossConfig):
             td = -(w[..., None] * v_next * logV[:, :T]).sum(-1)
             td = (td * valid).sum() / valid.sum()
             total, parts["td"] = total + lc.w_td * td, td
-        if lc.a:
-            st = sidx[cb["t"]]
-            logpiR = jax.nn.log_softmax(apply(cb["x_k"])["next"][jnp.arange(n), st, :N_ACTIONS], -1)   # [n, 4]
-            vc = apply(cb["children"])["value"][jnp.arange(n * N_ACTIONS), jnp.repeat(st, N_ACTIONS) + 2]
-            vc = sg(jax.nn.softmax(vc, -1)).reshape(n, N_ACTIONS, K)
-            vc = jnp.where(cb["child_term"][..., None], jax.nn.one_hot(cb["child_term_bin"], K), vc)
-            pi_t = sg(jnp.exp(logpi[jnp.arange(n), cb["t"]]))                      # [n, 4]
-            num = pi_t * (vc * jax.nn.one_hot(cb["k"], K)[:, None, :]).sum(-1)
-            Z = num.sum(-1)
-            ok = Z > 1e-8
-            la = -((num / jnp.maximum(Z, 1e-30)[:, None]) * logpiR).sum(-1)
-            la = (la * ok).sum() / jnp.maximum(ok.sum(), 1)
-            total = total + a_on * lc.w_a * la
-            parts.update(a=la, a_frac=ok.mean())
         return total, parts
 
     @jax.jit
-    def step(params, opt_state, x, tgt, mask, cb, a_on):
-        (loss, parts), g = jax.value_and_grad(loss_fn, has_aux=True)(params, x, tgt, mask, cb, a_on)
+    def step(params, opt_state, x, tgt, mask, cb):
+        (loss, parts), g = jax.value_and_grad(loss_fn, has_aux=True)(params, x, tgt, mask, cb)
         u, opt_state = opt.update(g, opt_state, params)
         return optax.apply_updates(params, u), opt_state, parts
 
     return step
+
+
+def make_a_step(model, tok: Tokenizer, opt_a):
+    """One A step: pi_R(. | h_t, k) toward the normalized posterior pi(a | h_t) V_{t+1}(k | child a)."""
+    types, sidx = jnp.asarray(tok.types), jnp.asarray(tok.sidx)
+    K = tok.K
+
+    def loss_fn(p, ab):
+        apply = lambda z: model.apply({"params": p}, z, types)
+        n = ab["t"].shape[0]
+        st = sidx[ab["t"]]
+        pi_t = sg(jax.nn.softmax(apply(ab["x_nor"])["next"][jnp.arange(n), st, :N_ACTIONS], -1))   # [n, 4]
+        logpiR = jax.nn.log_softmax(apply(ab["x_k"])["next"][jnp.arange(n), st, :N_ACTIONS], -1)
+        vc = apply(ab["children"])["value"][jnp.arange(n * N_ACTIONS), jnp.repeat(st, N_ACTIONS) + 2]
+        vc = sg(jax.nn.softmax(vc, -1)).reshape(n, N_ACTIONS, K)
+        vc = jnp.where(ab["child_term"][..., None], jax.nn.one_hot(ab["child_term_bin"], K), vc)
+        num = pi_t * (vc * jax.nn.one_hot(ab["k"], K)[:, None, :]).sum(-1)
+        Z = num.sum(-1)
+        ok = Z > 1e-8
+        la = -((num / jnp.maximum(Z, 1e-30)[:, None]) * logpiR).sum(-1)
+        la = (la * ok).sum() / jnp.maximum(ok.sum(), 1)
+        return la, dict(a=la, a_frac=ok.mean())
+
+    @jax.jit
+    def a_step(params, opt_state, ab):
+        (loss, parts), g = jax.value_and_grad(loss_fn, has_aux=True)(params, ab)
+        u, opt_state = opt_a.update(g, opt_state, params)
+        return optax.apply_updates(params, u), opt_state, parts
+
+    return a_step
 
 
 def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_heads=4, seed=0,
@@ -156,6 +178,10 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
     opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(lr))
     opt_state = opt.init(params)
     step = make_step(model, tok, opt, lc)
+    if lc.a:
+        opt_a = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(lc.lr_a))
+        a_opt_state = opt_a.init(params)
+        a_step = make_a_step(model, tok, opt_a)
     fwd = make_forward(model, tok) if eval_fn else None
     log(f"[{name}] {maze} params={count_params(params):,} train={n_train:,} held-out={N_HELDOUT} loss={lc}")
     rng = np.random.default_rng(seed)
@@ -169,15 +195,20 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
     if eval_fn:
         run_eval(0)
     n_nor = batch // 2
+    to_jnp = lambda tree: jax.tree_util.tree_map(jnp.asarray, tree)
     for i in range(1, steps + 1):
         idx = rng.integers(0, n_train, batch)
         x, tgt, mask = make_batch(tok, maze, d, idx)
-        cb = consistency_batch(tok, maze, d, idx[:n_nor], x[:n_nor], rng, lc) if lc.needs_value else {}
-        a_on = jnp.float32(i > lc.a_warmup * steps)
-        params, opt_state, parts = step(params, opt_state, jnp.asarray(x), jnp.asarray(tgt), jnp.asarray(mask),
-                                        jax.tree_util.tree_map(jnp.asarray, cb), a_on)
+        cb = value_batch(maze, d, idx[:n_nor]) if lc.main_value else {}
+        params, opt_state, parts = step(params, opt_state, jnp.asarray(x), jnp.asarray(tgt), jnp.asarray(mask), to_jnp(cb))
         for k, v in parts.items():
             recent.setdefault(k, []).append(float(v))
+        if lc.a and i > lc.a_warmup * steps:
+            for _ in range(lc.a_updates):
+                ab = a_batch(tok, maze, d, rng.integers(0, n_train, lc.a_batch), rng)
+                params, a_opt_state, ap = a_step(params, a_opt_state, to_jnp(ab))
+                for k, v in ap.items():
+                    recent.setdefault(k, []).append(float(v))
         if i % log_every == 0 or i == steps:
             hist.append(dict(step=i, **{k: float(np.mean(v)) for k, v in recent.items()}))
             recent = {}

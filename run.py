@@ -6,7 +6,7 @@
   python run.py testset      # exact test set from the DP -> data/canonical/testset.npz
   python run.py train [name] [steps] [consistency]   # half NOR half R mode; optional TD + A losses
   python run.py eval [name]            # accuracy by MODE setting and in-maze return by requested bin
-  python run.py sweep [steps]          # train base / mc / td / mc_a / td_a with exact-test tracking -> runs/sweep/
+  python run.py sweep [steps]          # train base / mc / td / mc_a4 / td_a4 with exact-test tracking -> runs/sweep/
   python run.py sweep-plot             # test-metric curves for the sweep -> runs/sweep/curves.png
 """
 import sys
