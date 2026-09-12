@@ -12,3 +12,6 @@ wheels/
 # run artefacts
 *.pkl
 results/**/detail.npz
+data/canonical/*
+!data/canonical/maze.txt
+runs/
