@@ -22,7 +22,7 @@ python tests/test_basic.py
 `colab/sweep.ipynb` clones this repo, rebuilds the dataset and the exact test set, and runs the
 loss-configuration sweep, saving runs to Google Drive so an interrupted session resumes where it stopped.
 Open it in Colab with File → Open notebook → GitHub, or at
-<https://colab.research.google.com/github/amdson/sillyrl/blob/colab-sweep/colab/sweep.ipynb>.
+<https://colab.research.google.com/github/amdson/scrl/blob/colab-sweep/colab/sweep.ipynb>.
 For a private repo, add a Colab secret `GITHUB_TOKEN` with read access.
 
 ## Maze and returns
