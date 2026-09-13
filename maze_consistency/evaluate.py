@@ -169,3 +169,56 @@ def plot_eval(maze, d, table, per_bin, counts, sweep, path):
     fig.tight_layout()
     fig.savefig(path, dpi=110)
     return fig
+
+
+def conditioning_response(params, model, tok: Tokenizer, maze, gt, cells=None, chunk=512):
+    """Does the MODE token actually move the policy, and by how much? One forward pass per (cell, MODE),
+    no rollouts -- so it is free of the compounding that makes return_sweep unreadable at T = 200.
+
+    At the prefix (MODE, s) the model's action distribution is directly comparable to the exact
+    piR_star[0, s, k], because that prefix carries no history for the two to disagree about. Returns per bin
+    k = 0..K-1, over the cells where bin k is feasible (h[0, s, k] > 0):
+
+        p_closer        [K+1, n]  P(model picks an action reducing distance to the goal); row 0 is NOR
+        p_closer_exact  [K, n]    the same under piR*   (the NOR truth is 1/4 by construction)
+        kl              [K, n]    KL(piR* || model)
+        kl_uniform      [K, n]    KL(piR* || uniform) -- what a MODE-IGNORING model scores. This is the
+                                  ceiling that makes `kl` readable: most of a raw act_kl is the irreducible
+                                  entropy of piR*, so the fraction below is the honest measure.
+        captured        [K]       1 - mean(kl) / mean(kl_uniform), the share of the conditioning signal learned
+        feasible        [K, n]    h[0, s, k] > 0
+
+    A flat p_closer across MODE settings means the model ignores the conditioning entirely, whatever its
+    act_kl looks like."""
+    cells = maze.start_cells if cells is None else np.asarray(cells)
+    n, K = len(cells), maze.K
+    fwd = make_forward(model, tok)
+    closer = np.zeros((n, N_ACTIONS), bool)
+    for a in range(N_ACTIONS):
+        closer[:, a] = maze.dist[maze.next_open[cells, a]] < maze.dist[cells]
+
+    def policy(mode):
+        x = tok.blank(n)
+        x[:, 0] = tok.mode(None if mode is None else np.full(n, mode))
+        x[:, 1] = tok.pos(cells)
+        lg = np.concatenate([np.asarray(fwd(params, jnp.asarray(x[i:i + chunk]))["pi_logits"][:, 0])
+                             for i in range(0, n, chunk)])
+        return np.exp(_log_softmax(lg.astype(np.float64)))
+
+    q = np.stack([policy(m) for m in [None] + list(range(K))])            # [K+1, n, 4]
+    p = np.transpose(gt.piR_star[0, cells], (1, 0, 2))                    # [K, n, 4]
+    feasible = gt.h[0, cells].T > 0                                       # [K, n]
+    p = np.where(feasible[..., None], np.nan_to_num(p), 0.25)
+
+    def kl(qq):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where(p > 0, p * (np.log(p) - np.log(np.maximum(qq, 1e-30))), 0.0).sum(-1)
+
+    k_model, k_unif = kl(q[1:]), kl(np.full_like(p, 0.25))
+    m = feasible & np.isfinite(k_model)
+    captured = np.array([1 - k_model[k][m[k]].mean() / k_unif[k][m[k]].mean()
+                         if m[k].any() and k_unif[k][m[k]].mean() > 0 else np.nan for k in range(K)])
+    return dict(cells=cells, p_closer=(q * closer[None]).sum(-1),
+                p_closer_exact=(p * closer[None]).sum(-1),
+                kl=k_model, kl_uniform=k_unif, captured=captured, feasible=m,
+                dist=maze.dist[cells])

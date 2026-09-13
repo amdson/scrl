@@ -50,6 +50,13 @@ python run.py cons-sweep 3000   # mc baseline vs every consistency loss -> runs/
 python run.py cons-plot         # test curves + collapse diagnostics
 ```
 
+`evaluate.conditioning_response` asks whether the MODE token moves the policy at all: one forward pass per
+(start cell, MODE), no rollouts, so it avoids the compounding that makes `return_sweep` unreadable at T = 200.
+It reports `P(step toward the goal)` against the exact `piR*` and a **captured fraction**,
+`1 - KL(piR* || model) / KL(piR* || uniform)` -- the share of the conditioning signal learned, where the
+denominator is what a MODE-ignoring model scores. Most of a raw `act_kl` is the irreducible entropy of `piR*`,
+so the fraction is the readable version. All three Colab notebooks plot it.
+
 `colab/consistency_sweep.ipynb` is the same comparison on a GPU, writing to Drive:
 <https://colab.research.google.com/github/amdson/scrl/blob/main/colab/consistency_sweep.ipynb>.
 It defines the sweep, plots and table as plain local functions so every parameter is editable in the Colab
