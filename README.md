@@ -65,6 +65,29 @@ session; `experiments.py` is the packaged equivalent behind the CLI. Each object
 scaled family in loss value. `consistency.exact_terms` gives the same quantities for the true model from the
 DP, where every loss is 0, so the sweep's held-out `cons/` curves are absolute.
 
+## Outcome binning
+
+`Maze(binning=...)` chooses how arrival time L is partitioned into the K value-head bins.
+
+`"uniform"` (the default, unchanged) splits L evenly -- equivalently log R evenly, since log R = L log gamma.
+On this maze that wastes almost every bin: T = 200 makes each bin ~18 steps wide while the longest
+shortest-path is 20, so **all optimal play lands in bins 10-11** and bins 1-9 all mean "wandered for 37-200
+steps". Conditioning on them requests near-identical behaviour (exact P(step toward goal) moves only
+0.30 -> 0.41 across bins 0..9), so a model that ignores MODE is nearly correct on 92% of its data.
+
+`"geometric"` splits log L, concentrating resolution where optimal play lives. Bins usable by optimal play:
+
+| K | uniform | geometric | exact KL(optimal \|\| piR*) at each start's best bin, uniform -> geometric |
+| --- | --- | --- | --- |
+| 6 | 1 of 5 | 3 of 5 | 0.747 -> 0.355 |
+| 12 | 2 of 11 | 7 of 11 | 0.391 -> 0.163 |
+| 24 | 3 of 23 | 11 of 23 | 0.274 -> 0.077 |
+
+Only the labels change, so the stored rollouts are untouched: a variant needs no dataset rebuild, just its
+own exact test set. `Maze.empty_bins` reports bins no integer arrival time can land in (geometric leaves
+18, 21, 22 empty at K = 24) -- dead value-head classes with h = 0 everywhere, which `build_testset` now skips.
+`colab/binning.ipynb` sweeps the grid.
+
 ## Maze and returns
 
 `data/canonical/maze.txt` is the layout, hand-edited; the build reads it and never overwrites it.

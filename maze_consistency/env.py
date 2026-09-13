@@ -4,8 +4,20 @@ Cells are flattened row-major: cell = y * W + x (row y counted from the top, col
 Actions: 0=U 1=D 2=L 3=R. Moving into a wall = stay in place (still costs a step).
 Rollouts start at a uniformly random open cell (not the goal); there is no fixed start.
 Return: reward 1 on reaching the goal and 0 otherwise, discounted, so R = gamma**L if the goal is reached
-in L steps and R = 0 if not, counted from the rollout's own start. Value-head bins (K = n_bins): bin 0 is R = 0; bins 1..K-1 split log R evenly
-between log(gamma**T) and 0. Because log R = L log(gamma), each bin is a run of ~T/(K-1) arrival steps.
+in L steps and R = 0 if not, counted from the rollout's own start. Value-head bins (K = n_bins): bin 0 is R = 0,
+and bins 1..K-1 partition the arrival time L, highest bin = fastest.
+
+`binning` chooses that partition:
+    "uniform"    even in L (equivalently even in log R, since log R = L log gamma): each bin is a run of
+                 ~T/(K-1) arrival steps. This is the original scheme, and on a maze whose longest
+                 shortest-path is much smaller than T it wastes most of its bins: with T=200, K=12 and a
+                 max distance of 20, every optimal trajectory lands in the top two bins and the other nine
+                 all mean "wandered for 37-200 steps", so conditioning on them requests near-identical
+                 behaviour (exact P(step toward goal) moves only 0.30 -> 0.41 across bins 0..9).
+    "geometric"  even in log L, so resolution concentrates where optimal play actually lives. Bin widths
+                 grow like T**(1/(K-1)); with T=200, K=12 the edges are L = 1, 2, 3, 4, 7, 11, 18, 29, 47,
+                 76, 124, 200, putting ~6 bins inside the optimal range instead of 2. The cost is thin data
+                 in the fastest bins, which is what varying K is for.
 """
 from __future__ import annotations
 
@@ -59,6 +71,7 @@ class Maze:
     gamma: float = 0.95
     n_bins: int = 12
     name: str = "maze"
+    binning: str = "uniform"  # "uniform" (even in L) or "geometric" (even in log L); see the module docstring
 
     FAIL_BIN = 0              # value-head bin for R = 0 (goal not reached)
 
@@ -67,6 +80,8 @@ class Maze:
         self.H, self.W = self.grid.shape
         self.n_cells = self.H * self.W
         self.K = self.n_bins
+        if self.binning not in ("uniform", "geometric"):
+            raise ValueError(f"binning={self.binning!r} not in uniform|geometric")
         self.next_open = _next_table(self.grid != WALL)
         self.dist = _bfs_dist(self.next_open, self.goal)          # steps to the goal from every cell (-1: wall)
         self.start_cells = np.flatnonzero(self.dist > 0)          # rollouts start uniformly on these
@@ -77,17 +92,38 @@ class Maze:
         return np.where(np.asarray(reached), self.gamma ** np.asarray(length, dtype=np.float64), 0.0)
 
     def outcome_bin(self, length, reached):
+        """Bin of an episode that took `length` steps: 0 if it never reached the goal, else 1..K-1 with the
+        highest bin the fastest arrival. Monotonically non-increasing in L under either scheme."""
         L = np.asarray(length).astype(np.int64)
-        b = 1 + ((self.K - 1) * (self.T - L)) // self.T        # exact integer form of the log-R binning
+        if self.binning == "uniform":
+            b = 1 + ((self.K - 1) * (self.T - L)) // self.T    # exact integer form of the log-R binning
+        else:                                                  # even in log L
+            Lc = np.clip(L, 1, self.T).astype(np.float64)
+            b = (self.K - 1) - np.floor((self.K - 1) * np.log(Lc) / np.log(self.T)).astype(np.int64)
         return np.where(np.asarray(reached), np.clip(b, 1, self.K - 1), self.FAIL_BIN)
+
+    @property
+    def empty_bins(self) -> list:
+        """Bins no integer arrival time can land in -- dead value-head classes with h = 0 everywhere, where
+        piR* is undefined and conditioning is meaningless. Geometric binning produces these once
+        T**(1/(K-1)) gets close to 1 (e.g. T=200, K=24 leaves bins 18, 21, 22 empty); uniform never does
+        while K-1 <= T. Check this before trusting a large-K geometric run."""
+        reach = set(int(k) for k in self.success_bin(np.arange(1, self.T + 1)))
+        return [k for k in range(1, self.K) if k not in reach]
+
+    @property
+    def L_edges(self) -> np.ndarray:
+        """K arrival-time boundaries, descending (slowest first), matching bin_edges."""
+        j = np.arange(self.K) / (self.K - 1)
+        return self.T * (1 - j) if self.binning == "uniform" else self.T ** (1 - j)
 
     def success_bin(self, L):
         return self.outcome_bin(L, True)
 
     @property
     def bin_edges(self) -> np.ndarray:
-        """R edges of bins 1..K-1, ascending: K values from gamma**T to 1."""
-        return self.gamma ** (self.T * (1 - np.arange(self.K) / (self.K - 1)))
+        """R edges of bins 1..K-1, ascending in R (so descending in arrival time)."""
+        return self.gamma ** self.L_edges
 
     @property
     def bin_reward(self) -> np.ndarray:
@@ -118,10 +154,12 @@ class Maze:
         return "\n".join(rows)
 
     def __repr__(self):
-        return f"Maze({self.name}: {self.H}x{self.W}, max dist={self.dist.max()}, T={self.T}, K={self.K}, gamma={self.gamma})"
+        return (f"Maze({self.name}: {self.H}x{self.W}, max dist={self.dist.max()}, T={self.T}, K={self.K}, "
+                f"gamma={self.gamma}, binning={self.binning})")
 
 
-def maze_from_ascii(text: str, T: int, gamma: float = 0.95, n_bins: int = 12, name: str = "maze") -> Maze:
+def maze_from_ascii(text: str, T: int, gamma: float = 0.95, n_bins: int = 12, name: str = "maze",
+                    binning: str = "uniform") -> Maze:
     rows = [ln for ln in text.strip("\n").splitlines() if ln.strip()]
     W = max(len(r) for r in rows)
     grid = np.full((len(rows), W), WALL, dtype=np.int8)
@@ -130,7 +168,7 @@ def maze_from_ascii(text: str, T: int, gamma: float = 0.95, n_bins: int = 12, na
             grid[r, c] = CELL_CHARS.index(ch)
     grid[grid == START] = OPEN                                    # no fixed start: an S is just an open cell
     goal = int(np.flatnonzero(grid.reshape(-1) == GOAL)[0])
-    return Maze(grid, goal, T, gamma=gamma, n_bins=n_bins, name=name)
+    return Maze(grid, goal, T, gamma=gamma, n_bins=n_bins, name=name, binning=binning)
 
 
 def random_walk_episodes(maze: Maze, N: int, seed: int, starts=None) -> dict:

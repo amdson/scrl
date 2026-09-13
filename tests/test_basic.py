@@ -63,6 +63,34 @@ def test_next_targets():
     assert tgt[mask].min() >= 0 and tgt[mask].max() < tok.n_out
 
 
+def test_binning_schemes():
+    """Both schemes bin arrival time monotonically; geometric spends far more of its bins on the range
+    optimal play can actually reach, which is the whole point of it."""
+    import numpy as _np
+    from maze_consistency.dataset import canonical_maze
+    L = _np.arange(1, M.T + 1)
+    used = {}
+    for binning in ("uniform", "geometric"):
+        for K in (6, 12, 24):
+            m = canonical_maze(n_bins=K, binning=binning)
+            b = m.success_bin(L)
+            assert (_np.diff(b) <= 0).all(), (binning, K)                  # never faster -> lower bin
+            assert b.min() >= 1 and b.max() <= K - 1
+            assert m.outcome_bin(_np.array([5]), _np.array([False]))[0] == m.FAIL_BIN
+            used[(binning, K)] = len(set(int(x) for x in m.success_bin(_np.arange(1, m.dist.max() + 1))))
+    for K in (6, 12, 24):
+        assert used[("geometric", K)] > used[("uniform", K)], K
+    assert used[("uniform", 12)] == 2 and used[("geometric", 12)] == 7     # 2 of 11 bins vs 7 of 11
+
+    assert canonical_maze(n_bins=12, binning="uniform").empty_bins == []
+    assert canonical_maze(n_bins=24, binning="geometric").empty_bins == [18, 21, 22]
+
+    # the default is unchanged, so every existing run and cached test set stays valid
+    d = canonical_maze()
+    assert d.binning == "uniform" and d.K == 12
+    assert (d.success_bin(L) == (1 + (11 * (M.T - L)) // M.T).clip(1, 11)).all()
+
+
 if __name__ == "__main__":
     for k, v in list(globals().items()):
         if k.startswith("test_"):

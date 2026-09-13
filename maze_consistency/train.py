@@ -215,9 +215,12 @@ def make_a_step(model, tok: Tokenizer, opt_a):
 
 def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_heads=4, seed=0,
           loss: LossConfig | None = None, consistency=False, a_warmup=None,
-          eval_fn=None, eval_every=0, log_every=100, log=print, cons_sampler=None):
+          eval_fn=None, eval_every=0, log_every=100, log=print, cons_sampler=None, maze_kw=None):
     """loss: a LossConfig (default: next-token only). consistency=True is shorthand for LossConfig(td=True, a=True).
     eval_fn(params, fwd) -> dict of metrics, called at step 0, every eval_every steps, and at the end.
+
+    maze_kw is forwarded to dataset.load, so a run can use a different outcome binning (n_bins / binning)
+    without touching the stored rollouts. Its exact test set has to be rebuilt to match.
 
     cons_sampler(params, rng, n, step) -> a batch dict like consistency.rollout_batch, overriding where the
     consistency term's rollouts come from. The interval identity constrains the model's own conditionals and
@@ -226,7 +229,7 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
     lc = loss or (LossConfig(td=True, a=True) if consistency else LossConfig())
     if a_warmup is not None:
         lc = replace(lc, a_warmup=a_warmup)
-    maze, d = load()
+    maze, d = load(**(maze_kw or {}))      # maze_kw={"binning": ..., "n_bins": ...} relabels outcomes only
     tok = Tokenizer(maze)
     n_train = len(d["length"]) - N_HELDOUT
     cfg = ModelConfig.for_tokenizer(tok, d_model=d_model, n_layers=n_layers, n_heads=n_heads)

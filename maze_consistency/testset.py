@@ -61,8 +61,15 @@ def build_testset(maze, n_per=200, seed=7, path=TEST_PATH, log=print):
     start_nor[cells] = 1.0 / len(cells)
     start_R = np.zeros((maze.K, maze.n_cells))
     start_R[:, cells] = gt.h[0, cells].T
-    start_R /= start_R.sum(1, keepdims=True)
-    names = ["NOR"] + [f"bin {k}" for k in range(maze.K)] + ["best far"]
+    tot = start_R.sum(1, keepdims=True)
+    # A bin no trajectory can ever land in has h = 0 everywhere, so there is nothing to condition on and no
+    # rollout to draw. Geometric binning produces these at large K (see Maze.empty_bins); leave the row at 0
+    # and drop the setting rather than dividing by zero and sampling from NaN.
+    start_R = np.divide(start_R, tot, out=np.zeros_like(start_R), where=tot > 0)
+    unreachable = [k for k in range(maze.K) if tot[k, 0] <= 0]
+    if unreachable:
+        log(f"  skipping unreachable bins {unreachable} (h = 0 everywhere; no conditioned rollout exists)")
+    names = (["NOR"] + [f"bin {k}" for k in range(maze.K) if k not in unreachable] + ["best far"])
     starts, bins, setting = [], [], []
     for i, name in enumerate(names):
         if name == "NOR":
@@ -71,7 +78,7 @@ def build_testset(maze, n_per=200, seed=7, path=TEST_PATH, log=print):
             s = rng.choice(cells[maze.dist[cells] >= FAR], n_per)
             b = maze.best_bin(s)
         else:
-            k = i - 1
+            k = int(name.split()[1])
             s, b = rng.choice(maze.n_cells, n_per, p=start_R[k]), np.full(n_per, k)
         starts.append(s); bins.append(b); setting.append(np.full(n_per, i))
     starts, bins, setting = np.concatenate(starts), np.concatenate(bins), np.concatenate(setting)

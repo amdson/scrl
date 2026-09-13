@@ -29,9 +29,11 @@ N_ROLLOUTS = 100_000
 DATA_SEED = 2026
 
 
-def canonical_maze(path: str = MAZE_FILE) -> Maze:
+def canonical_maze(path: str = MAZE_FILE, n_bins: int = N_BINS, binning: str = "uniform") -> Maze:
+    """The fixed layout. n_bins / binning only relabel outcomes -- the stored rollouts are unaffected, so a
+    variant needs no dataset rebuild, only its own exact test set (testset.build_testset(maze, path=...))."""
     with open(path) as f:
-        return maze_from_ascii(f.read(), T=T_MAX, name="canon12", gamma=GAMMA, n_bins=N_BINS)
+        return maze_from_ascii(f.read(), T=T_MAX, name="canon12", gamma=GAMMA, n_bins=n_bins, binning=binning)
 
 
 def build(out_dir: str = DATA_DIR, N: int = N_ROLLOUTS, seed: int = DATA_SEED, log=print) -> dict:
@@ -58,8 +60,8 @@ def build(out_dir: str = DATA_DIR, N: int = N_ROLLOUTS, seed: int = DATA_SEED, l
     return dict(maze=maze, data=rec, stats=stats)
 
 
-def load(out_dir: str = DATA_DIR):
-    maze = canonical_maze()
+def load(out_dir: str = DATA_DIR, **maze_kw):
+    maze = canonical_maze(**maze_kw)
     z = np.load(os.path.join(out_dir, "rollouts.npz"))
     return maze, {k: z[k] for k in z.files}
 
