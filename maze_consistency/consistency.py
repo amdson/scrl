@@ -40,6 +40,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from .env import N_ACTIONS as N_ACTIONS_
+
 
 # ---- residuals ---------------------------------------------------------------------------------
 
@@ -258,3 +260,61 @@ def evaluate(params, terms_fn, batch):
     t = terms_fn(params, *(jnp.asarray(batch[k]) for k in ("x_nor", "x_R", "targets", "R_bin")))
     r = residuals(t["u"], t["v"], t["b"], batch["lengths"])
     return t, r, all_losses(r), diagnostics(r, t["u"], t["v"], t["b"])
+
+
+# ---- the exact model: what a perfectly consistent model scores ---------------------------------
+
+def exact_terms(maze, gt, positions, actions, lengths, R_bins, n_max=None):
+    """u, v, b for the TRUE joint distribution, from the DP -- the reference every loss here is measured
+    against. All six objectives evaluate to exactly 0 on these, because
+
+        v_t - u_t = log piR*(a_t | t, s_t, k) - log(1/4) = log child_h[t,s_t,a_t,k] - log h[t,s_t,k]
+
+    and child_h[t,s,a,k] = h[t+1, next(s,a), k] = exp(b_{t+1}), so delta_t = b_{t+1} - b_t + b_t - b_{t+1} = 0.
+    The dynamics are deterministic, so their log ratio contributes nothing on a valid path.
+
+    Read against a model's own losses this makes them absolute: 0 is perfect consistency, not a floor that
+    has to be estimated. Only the trajectory's own outcome bin is safe here -- h[t, s_t, k] is 0 for a bin the
+    prefix has already ruled out, where the log form is undefined (note section 7, "handle exact zeros")."""
+    positions, actions = np.asarray(positions), np.asarray(actions)
+    lengths, R_bins = np.asarray(lengths).astype(np.int64), np.asarray(R_bins).astype(np.int64)
+    N = len(lengths)
+    T = maze.T if n_max is None else n_max
+    t_ix = np.arange(T)
+    edge = t_ix[None, :] < lengths[:, None]                   # blocks t = 0..n-1
+    node = np.arange(T + 1)[None, :] <= lengths[:, None]      # prefixes h_0..h_n
+    s = positions[:, :T].astype(np.int64)
+    a = actions[:, :T].astype(np.int64)
+    k = R_bins[:, None]
+
+    with np.errstate(divide="ignore", invalid="ignore"):
+        v = np.log(gt.piR_star[t_ix[None, :], s, k, a])       # [N, T]
+        b = np.log(gt.h[np.arange(T + 1)[None, :], positions[:, :T + 1].astype(np.int64), k])
+    u = np.full((N, T), -np.log(N_ACTIONS_))                  # uniform behaviour policy, deterministic dynamics
+    return (np.where(edge, u, 0.0), np.where(edge, np.nan_to_num(v), 0.0),
+            np.where(node, np.nan_to_num(b), 0.0))
+
+
+def exact_losses(maze, gt, d, idx):
+    """Every consistency loss for the true model on rollouts `idx` of dataset `d`. All ~0."""
+    u, v, b = exact_terms(maze, gt, d["positions"][idx], d["actions"][idx], d["length"][idx],
+                          maze.outcome_bin(d["length"][idx], d["reached"][idx]))
+    r = residuals(u, v, b, d["length"][idx])
+    return all_losses(r), r
+
+
+def make_heldout_eval(model, tok, maze, d, idx):
+    """An eval_fn-compatible callable: every consistency loss plus the collapse diagnostics, on one fixed
+    held-out batch. Unlike the `cons` value in the training log -- which is whichever objective that run
+    optimizes, on its own moving batch -- these are the same losses on the same rollouts for every config,
+    so they compare directly. The true model scores 0 on all of them (exact_losses)."""
+    terms_fn = make_terms_fn(model, tok)
+    batch = rollout_batch(tok, maze, d, idx)
+
+    def fn(params):
+        _, _, losses, diag = evaluate(params, terms_fn, batch)
+        out = {f"cons/{k}": float(jnp.mean(v)) for k, v in losses.items()}
+        out.update({f"diag/{k}": float(jnp.mean(diag[k])) for k in ("cond_gap", "info_gain", "drift")})
+        return out
+
+    return fn

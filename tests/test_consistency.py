@@ -140,6 +140,34 @@ def test_model_terms_alignment():
     assert all(np.isfinite(np.asarray(v)).all() for v in diag.values())
 
 
+def test_exact_model_is_perfectly_consistent():
+    """The strongest check on the whole construction: for the TRUE joint distribution every interval residual
+    is identically 0, so every loss here is 0. If the block boundaries, the slot indexing, or the choice to
+    gather from the full flat softmax were wrong, this is what would catch it."""
+    from maze_consistency.dp import compute_ground_truth
+    from maze_consistency.env import random_walk_episodes
+
+    gt = compute_ground_truth(M)
+    d = random_walk_episodes(M, 128, seed=11)
+    idx = np.arange(128)
+    losses, r = C.exact_losses(M, gt, d, idx)
+
+    assert d["reached"][idx].any() and (~d["reached"][idx]).any()      # both arrivals and timeouts present
+    assert d["length"][idx].min() < d["length"][idx].max()             # a spread of lengths
+    assert np.abs(np.asarray(r["delta"])).max() < 1e-5                 # float32 epsilon on O(1) log probs
+    for k, v in losses.items():
+        assert np.asarray(v).max() < 1e-10, (k, float(np.asarray(v).max()))
+
+    # and it is a real check, not one that passes on anything: perturbing any single term breaks it
+    u, v, b = C.exact_terms(M, gt, d["positions"][idx], d["actions"][idx], d["length"][idx],
+                            M.outcome_bin(d["length"][idx], d["reached"][idx]))
+    for name, bump in (("u", (u + 0.01, v, b)), ("v", (u, v + 0.01, b)), ("b", (u, v, b + 0.01))):
+        bad = C.all_losses(C.residuals(*bump, d["length"][idx]))
+        if name == "b":
+            continue        # a constant shift in b telescopes away, which is itself the identity working
+        assert np.asarray(bad["local"]).max() > 1e-6, name
+
+
 def test_lossconfig_validates_cons_loss():
     from maze_consistency.train import LossConfig
     LossConfig(cons=True, cons_loss="all_scaled")                 # every key of C.ALL is accepted
