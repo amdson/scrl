@@ -87,8 +87,17 @@ def rollout(params, action_logits, tok: Tokenizer, maze, mode_bins, starts, rng,
         if not alive.any():
             break
     reached = ~alive
+    # positions / actions in the dataset's layout, so a rollout batch can be fed straight to
+    # consistency.rollout_batch or Tokenizer.encode_body.
+    positions = np.zeros((N, T + 1), dtype=np.int32)
+    positions[:, 0] = starts
+    positions[:, 1:] = x[:, tok.sidx[1:], 1] + x[:, tok.sidx[1:], 2] * maze.W
+    actions = x[:, tok.aidx, 0].astype(np.int8) - tok.ACT0
+    steps = np.arange(T)[None, :] < length[:, None]
+    positions[:, 1:] = np.where(steps, positions[:, 1:], maze.goal)
     return dict(starts=starts, length=length, reached=reached, returns=maze.return_of(length, reached),
-                bins=maze.outcome_bin(length, reached))
+                bins=maze.outcome_bin(length, reached),
+                positions=positions, actions=np.where(steps, actions, 0))
 
 
 def return_sweep(params, model, tok: Tokenizer, maze, n_per=64, seed=0, greedy=False):

@@ -57,6 +57,12 @@ class LossConfig:
     w_cons: float = 0.1       # lambda_cons
     cons_batch: int = 16      # rollouts per step; each costs two forward passes (NOR and R)
     cons_warmup: float = 0.0  # fraction of training before the consistency term switches on
+    cons_detach: str = "none"  # stop-gradient inside the consistency term: none | b | uv | u
+                               #   b  : the value head is a fixed teacher; only the token heads move
+                               #   uv : the token heads are fixed; only the value head moves
+                               # Detaching a whole TERM is well defined under the variance shortcut (it happens
+                               # before delta and c are formed). Per-interval teacher/target detachment is not
+                               # -- the c_k are shared across every pair (note section 6).
 
     @property
     def main_value(self) -> bool:
@@ -65,6 +71,8 @@ class LossConfig:
     def __post_init__(self):
         if self.cons and self.cons_loss not in C.ALL:
             raise ValueError(f"cons_loss={self.cons_loss!r} not in {sorted(C.ALL)}")
+        if self.cons_detach not in ("none", "b", "uv", "u"):
+            raise ValueError(f"cons_detach={self.cons_detach!r} not in none|b|uv|u")
 
 
 def make_batch(tok: Tokenizer, maze, d, idx, p_nor=0.5):
@@ -121,8 +129,15 @@ def make_step(model, tok: Tokenizer, opt, lc: LossConfig):
     def cons_term(p, nb):
         """lambda_cons * L_cons on its own batch, both modes on the same rollouts."""
         t = terms(p, nb["x_nor"], nb["x_R"], nb["targets"], nb["R_bin"])
-        r = C.residuals(t["u"], t["v"], t["b"], nb["lengths"])
-        dg = C.diagnostics(r, t["u"], t["v"], t["b"])
+        u, v, b = t["u"], t["v"], t["b"]
+        if lc.cons_detach == "b":                 # value head as a fixed teacher
+            b = sg(b)
+        elif lc.cons_detach == "uv":              # token heads as fixed teachers
+            u, v = sg(u), sg(v)
+        elif lc.cons_detach == "u":               # only the unconditioned ordering is fixed
+            u = sg(u)
+        r = C.residuals(u, v, b, nb["lengths"])
+        dg = C.diagnostics(r, t["u"], t["v"], t["b"])      # diagnostics always read the undetached terms
         # cond_gap and info_gain are the collapse check: the degenerate optimum of every consistency loss is
         # "ignore R" (v == u, b flat in t), which drives both to 0 while L_cons falls. Logged, never optimized.
         return C.ALL[lc.cons_loss](r).mean(), dict(cond_gap=dg["cond_gap"].mean(),
@@ -200,9 +215,14 @@ def make_a_step(model, tok: Tokenizer, opt_a):
 
 def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_heads=4, seed=0,
           loss: LossConfig | None = None, consistency=False, a_warmup=None,
-          eval_fn=None, eval_every=0, log_every=100, log=print):
+          eval_fn=None, eval_every=0, log_every=100, log=print, cons_sampler=None):
     """loss: a LossConfig (default: next-token only). consistency=True is shorthand for LossConfig(td=True, a=True).
-    eval_fn(params, fwd) -> dict of metrics, called at step 0, every eval_every steps, and at the end."""
+    eval_fn(params, fwd) -> dict of metrics, called at step 0, every eval_every steps, and at the end.
+
+    cons_sampler(params, rng, n, step) -> a batch dict like consistency.rollout_batch, overriding where the
+    consistency term's rollouts come from. The interval identity constrains the model's own conditionals and
+    needs no labels, so it is valid on ANY trajectory distribution -- which is the point of passing model
+    rollouts here rather than the random-walk training set. Default: uniform from the training set."""
     lc = loss or (LossConfig(td=True, a=True) if consistency else LossConfig())
     if a_warmup is not None:
         lc = replace(lc, a_warmup=a_warmup)
@@ -237,7 +257,12 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
         idx = rng.integers(0, n_train, batch)
         x, tgt, mask = make_batch(tok, maze, d, idx)
         cb = value_batch(maze, d, idx[:n_nor]) if lc.main_value else {}
-        nb = cons_batch(tok, maze, d, rng.integers(0, n_train, lc.cons_batch)) if lc.cons else {}
+        if not lc.cons:
+            nb = {}
+        elif cons_sampler is not None:
+            nb = cons_sampler(params, rng, lc.cons_batch, i)
+        else:
+            nb = cons_batch(tok, maze, d, rng.integers(0, n_train, lc.cons_batch))
         cons_on = float(lc.cons and i > lc.cons_warmup * steps)
         params, opt_state, parts = step(params, opt_state, jnp.asarray(x), jnp.asarray(tgt), jnp.asarray(mask),
                                         to_jnp(cb), to_jnp(nb), jnp.float32(cons_on))
