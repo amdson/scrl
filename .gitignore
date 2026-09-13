@@ -15,3 +15,6 @@ results/**/detail.npz
 data/canonical/*
 !data/canonical/maze.txt
 runs/
+
+# Claude Code worktrees
+.claude/

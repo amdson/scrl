@@ -25,6 +25,19 @@ Open it in Colab with File → Open notebook → GitHub, or at
 <https://colab.research.google.com/github/amdson/scrl/blob/colab-sweep/colab/sweep.ipynb>.
 For a private repo, add a Colab secret `GITHUB_TOKEN` with read access.
 
+## Interval consistency losses
+
+`consistency_losses.md` is the note; `maze_consistency/consistency.py` implements it and
+`consistency_demo.ipynb` is a short run showing what the objectives look like on real rollouts (magnitude,
+spread across trajectories, scaling with length, and gradient pull relative to the data loss).
+
+Two teacher-forced passes over the same rollout -- MODE = NOR and MODE = the rollout's own bin -- give
+`u_t`, `v_t` and `b_t = log q_t(R)` at every env-step boundary, and `delta_t = v_t - u_t + b_{t-1} - b_t`.
+Losses over all n(n+1)/2 intervals: `local`, `all` (the 2(n+1)/n * Var(c) shortcut), `all_scaled`, `mixed`,
+`poly_len`, `multiscale`. No model change was needed -- the value head is already read at every state slot.
+`python tests/test_consistency.py` checks the fast forms against explicit interval enumeration in both
+values and gradients.
+
 ## Maze and returns
 
 `data/canonical/maze.txt` is the layout, hand-edited; the build reads it and never overwrites it.
@@ -64,5 +77,6 @@ maze_consistency/
   evaluate.py  mode accuracy and in-maze return sweeps
   testset.py   exact test set from the DP, and scoring against it
   experiments.py  loss-configuration sweeps with test tracking, and their plots
+  consistency.py  interval consistency losses (consistency_losses.md), plus brute-force references
 run.py         CLI
 ```
