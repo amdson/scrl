@@ -11,6 +11,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
+from .dp import compute_ground_truth
 from .env import N_ACTIONS
 from .tokens import Tokenizer
 from .model import make_forward
@@ -222,3 +223,128 @@ def conditioning_response(params, model, tok: Tokenizer, maze, gt, cells=None, c
                 p_closer_exact=(p * closer[None]).sum(-1),
                 kl=k_model, kl_uniform=k_unif, captured=captured, feasible=m,
                 dist=maze.dist[cells])
+
+
+def prefix_response(params, model, tok: Tokenizer, maze, gt, d, idx,
+                    depth_edges=(0, 1, 4, 16, 64, 201), chunk=128):
+    """Conditioning response at EVERY prefix of a set of trajectories, not just the t = 0 start.
+
+    conditioning_response probes one prefix per cell: (MODE, s). This sweeps MODE over real prefixes drawn
+    from data, at every depth, which is where the model actually operates and what the test set's act_kl
+    averages over. Causal attention makes it cheap -- one forward pass per (trajectory, MODE) reads out the
+    conditioned policy at all T+1 state slots at once, so the whole thing is K+1 passes.
+
+    The exact target at prefix h_t is piR_star[t, s_t, k]: the chain is Markov in (t, s), so conditioning on
+    the full history does not change it, and the model's readout is directly comparable.
+
+    Feasibility matters much more here than at t = 0. Deep into a trajectory most bins are already ruled out
+    (h[t, s_t, k] = 0, piR* undefined), so the mask is depth-dependent and `n_feasible` is reported: a bin
+    that no longer has support is not a failure to condition, it is an impossible request.
+
+    Returns per depth bucket [t_lo, t_hi):
+        captured    [n_buckets, K]  1 - KL(piR*||model) / KL(piR*||uniform), the share of signal used
+        p_closer    [n_buckets, K]  model P(step toward goal)
+        p_exact     [n_buckets, K]  the same under piR*
+        n_feasible  [n_buckets, K]  prefixes contributing
+    """
+    idx = np.asarray(idx)
+    N, T, K = len(idx), maze.T, maze.K
+    body = tok.encode_body(d["positions"][idx], d["actions"][idx], d["length"][idx])
+    L = d["length"][idx].astype(np.int64)
+    pos = d["positions"][idx].astype(np.int64)[:, :T]                       # [N, T] cell at each state slot
+    fwd = make_forward(model, tok)
+    ts = np.arange(T)[None, :]
+    valid = ts < L[:, None]                                                 # slots that actually take an action
+
+    closer = np.zeros((N, T, N_ACTIONS), bool)
+    for a in range(N_ACTIONS):
+        closer[..., a] = maze.dist[maze.next_open[pos, a]] < maze.dist[pos]
+
+    q = []
+    for k in range(K):
+        x = tok.with_mode(body, np.full(N, k))
+        pi = np.concatenate([np.asarray(fwd(params, jnp.asarray(x[i:i + chunk]))["pi_logits"][:, :T])
+                             for i in range(0, N, chunk)])
+        q.append(np.exp(_log_softmax(pi.astype(np.float64))))
+    q = np.stack(q)                                                         # [K, N, T, 4]
+
+    p = np.transpose(gt.piR_star[ts, pos], (2, 0, 1, 3))                    # [K, N, T, 4] exact
+    feas = np.transpose(gt.h[ts, pos] > 0, (2, 0, 1)) & valid[None]         # [K, N, T]
+    p = np.where(feas[..., None], np.nan_to_num(p), 0.25)
+
+    def kl(qq):
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where(p > 0, p * (np.log(p) - np.log(np.maximum(qq, 1e-30))), 0.0).sum(-1)
+
+    k_model, k_unif = kl(q), kl(np.full_like(p, 0.25))
+    ok = feas & np.isfinite(k_model) & np.isfinite(k_unif)
+    pc_m, pc_e = (q * closer[None]).sum(-1), (p * closer[None]).sum(-1)
+
+    edges = list(depth_edges)
+    buckets = [(lo, hi) for lo, hi in zip(edges[:-1], edges[1:])]
+    shape = (len(buckets), K)
+    cap, pm, pe, nf = (np.full(shape, np.nan) for _ in range(4))
+    for bi, (lo, hi) in enumerate(buckets):
+        in_d = (ts >= lo) & (ts < hi)
+        for k in range(K):
+            m = ok[k] & in_d
+            nf[bi, k] = m.sum()
+            if not m.any():
+                continue
+            pm[bi, k], pe[bi, k] = pc_m[k][m].mean(), pc_e[k][m].mean()
+            denom = k_unif[k][m].mean()
+            cap[bi, k] = 1 - k_model[k][m].mean() / denom if denom > 0 else np.nan
+    return dict(buckets=buckets, captured=cap, p_closer=pm, p_exact=pe, n_feasible=nf)
+
+
+def make_enrichment_eval(tok: Tokenizer, maze, d, n=128, seed=0, chunk=64):
+    """Factory for an eval_fn-compatible probe: does conditioning on a higher reward enrich goalward actions?
+
+    Paired per prefix. At every step of every held-out trajectory the same model is asked twice --
+        fail  MODE = bin 0
+        best  MODE = success_bin(t + dist(s_t)), the best outcome still achievable from here
+    -- and scored on the probability mass it puts on actions that reduce distance to the goal. Both columns
+    come from the identical prefix, so the difference is conditioning alone: no feasibility or composition
+    artefact. Prefixes from which the goal is already unreachable are dropped.
+
+    Returns {"enrich/points", "enrich/frac_of_exact", "goalward/fail", "goalward/best"}. The "/" split keeps
+    them plottable by the notebooks' plot_curves(metrics=("enrich",), settings=("points", ...)).
+
+    The exact conditional's enrichment is computed once as the ceiling -- on the canonical maze it is about
+    +40 points, so frac_of_exact is a share of a large, real effect rather than of an estimated one.
+
+    Costs K forward passes of `n` sequences per call, so keep n modest if eval_every is small."""
+    n = (n // chunk) * chunk or chunk                  # keep every batch the same shape, so fwd compiles once
+    n_train = len(d["length"]) - N_HELDOUT
+    idx = np.random.default_rng(seed).choice(np.arange(n_train, n_train + N_HELDOUT), n, replace=False)
+    T, K = maze.T, maze.K
+    body = tok.encode_body(d["positions"][idx], d["actions"][idx], d["length"][idx])
+    x_all = np.stack([tok.with_mode(body, np.full(n, k)) for k in range(K)])      # [K, n, L, 3]
+    pos = d["positions"][idx].astype(np.int64)[:, :T]
+    ts = np.arange(T)[None, :]
+    togo = ts + maze.dist[pos]
+    use = (ts < d["length"][idx].astype(np.int64)[:, None]) & (togo <= T)
+    k_best = np.clip(maze.success_bin(togo), 1, K - 1)
+    closer = np.stack([maze.dist[maze.next_open[pos, a]] < maze.dist[pos] for a in range(N_ACTIONS)], -1)
+    nn = np.arange(n)[:, None]
+
+    def score_q(q):                                    # q [K, n, T, 4] -> (fail, best, enrichment) in %
+        g = (q * closer[None]).sum(-1)
+        fail, best = g[0][use], g[k_best, nn, ts][use]
+        return 100 * fail.mean(), 100 * best.mean(), 100 * (best - fail).mean()
+
+    gt = compute_ground_truth(maze)
+    ceiling = score_q(np.nan_to_num(np.transpose(gt.piR_star[ts, pos], (2, 0, 1, 3)), nan=0.25))[2]
+
+    def fn(params, fwd):
+        q = []
+        for k in range(K):
+            lg = np.concatenate([np.asarray(fwd(params, jnp.asarray(x_all[k, i:i + chunk]))["pi_logits"][:, :T])
+                                 for i in range(0, n, chunk)]).astype(np.float64)
+            q.append(np.exp(_log_softmax(lg)))
+        fail, best, delta = score_q(np.stack(q))
+        return {"enrich/points": delta, "enrich/frac_of_exact": delta / ceiling if ceiling else np.nan,
+                "goalward/fail": fail, "goalward/best": best}
+
+    fn.ceiling = ceiling
+    return fn
