@@ -22,7 +22,7 @@ python tests/test_basic.py
 `colab/sweep.ipynb` clones this repo, rebuilds the dataset and the exact test set, and runs the
 loss-configuration sweep, saving runs to Google Drive so an interrupted session resumes where it stopped.
 Open it in Colab with File → Open notebook → GitHub, or at
-<https://colab.research.google.com/github/amdson/scrl/blob/colab-sweep/colab/sweep.ipynb>.
+<https://colab.research.google.com/github/amdson/scrl/blob/main/colab/sweep.ipynb>.
 For a private repo, add a Colab secret `GITHUB_TOKEN` with read access.
 
 ## Interval consistency losses
@@ -50,9 +50,13 @@ python run.py cons-sweep 3000   # mc baseline vs every consistency loss -> runs/
 python run.py cons-plot         # test curves + collapse diagnostics
 ```
 
-`colab/consistency_sweep.ipynb` is the same comparison on a GPU, writing to Drive. Each objective gets its own
-`lambda_cons` (`experiments.CONS_LAMBDA`) chosen for roughly equal gradient pull, since raw `all` and
-`poly_len` sit ~100x above the scaled family in loss value.
+`colab/consistency_sweep.ipynb` is the same comparison on a GPU, writing to Drive:
+<https://colab.research.google.com/github/amdson/scrl/blob/main/colab/consistency_sweep.ipynb>.
+It defines the sweep, plots and table as plain local functions so every parameter is editable in the Colab
+session; `experiments.py` is the packaged equivalent behind the CLI. Each objective gets its own
+`lambda_cons` chosen for roughly equal gradient pull, since raw `all` and `poly_len` sit ~100x above the
+scaled family in loss value. `consistency.exact_terms` gives the same quantities for the true model from the
+DP, where every loss is 0, so the sweep's held-out `cons/` curves are absolute.
 
 ## Maze and returns
 
