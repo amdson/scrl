@@ -6,6 +6,7 @@
   python run.py testset      # exact test set from the DP -> data/canonical/testset.npz
   python run.py train [name] [steps] [consistency]   # half NOR half R mode; optional TD + A losses
   python run.py eval [name]            # accuracy by MODE setting and in-maze return by requested bin
+  python run.py value-eval [name]      # value head's E[R] vs the exact E[R] on every test-set prefix
   python run.py sweep [steps]          # train base / mc / td / mc_a4 / td_a4 with exact-test tracking -> runs/sweep/
   python run.py sweep-plot             # test-metric curves for the sweep -> runs/sweep/curves.png
 """
@@ -85,6 +86,22 @@ def main():
         path = f"{RUNS_DIR}/{name}/eval.png"
         E.plot_eval(maze, d, table, per_bin, counts, sweep, path)
         print("wrote", path)
+    elif cmd == "value-eval":
+        from maze_consistency.dataset import canonical_maze
+        from maze_consistency.tokens import Tokenizer
+        from maze_consistency.model import MazeTransformer, make_forward
+        from maze_consistency.train import load_run
+        from maze_consistency.value_eval import value_accuracy
+        name = sys.argv[2] if len(sys.argv) > 2 else "tf"
+        tok = Tokenizer(canonical_maze())
+        params, cfg = load_run(name)
+        per = value_accuracy(params, make_forward(MazeTransformer(cfg), tok), tok)["per_setting"]
+        print(f"[{name}] value head E[R] vs exact E[R], every test-set prefix (MODE = NOR); "
+              "bins_* = exact bin distribution h under the same readout (the K-bin floor)")
+        print(f"  {'setting':9s} {'prefixes':>8s} {'ev_mae':>8s} {'bins_mae':>8s} {'ev_logerr':>9s} {'bins_logerr':>11s} {'ev_bias':>8s}")
+        for k, r in per.items():
+            print(f"  {k:9s} {r['n_prefixes']:8d} {r['ev_mae']:8.4f} {r['bins_mae']:8.4f} {r['ev_logerr']:9.3f} "
+                  f"{r['bins_logerr']:11.3f} {r['ev_bias']:+8.3f}")
     elif cmd == "sweep":
         from maze_consistency.experiments import SweepConfig, run_sweep
         run_sweep(SweepConfig(steps=int(sys.argv[2])) if len(sys.argv) > 2 else SweepConfig())
