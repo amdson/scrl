@@ -140,6 +140,57 @@ def test_model_terms_alignment():
     assert all(np.isfinite(np.asarray(v)).all() for v in diag.values())
 
 
+def test_lossconfig_validates_cons_loss():
+    from maze_consistency.train import LossConfig
+    LossConfig(cons=True, cons_loss="all_scaled")                 # every key of C.ALL is accepted
+    for k in C.ALL:
+        LossConfig(cons=True, cons_loss=k)
+    try:
+        LossConfig(cons=True, cons_loss="nope")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("bad cons_loss should raise")
+    assert LossConfig(cons=False, cons_loss="nope").cons_loss == "nope"    # unchecked when cons is off
+
+
+def test_cons_training_step_runs_and_logs():
+    """Each objective trains, and the collapse diagnostics are logged alongside it."""
+    import jax.numpy as jnp
+    import optax
+    from maze_consistency.train import LossConfig, make_step, make_batch, value_batch, cons_batch
+    from maze_consistency.env import random_walk_episodes
+    from maze_consistency.model import ModelConfig, MazeTransformer
+
+    tok = Tokenizer(M)
+    d = random_walk_episodes(M, 8, seed=5)
+    cfg = ModelConfig.for_tokenizer(tok, d_model=32, n_layers=1, n_heads=2)
+    model = MazeTransformer(cfg)
+    p0 = model.init(jax.random.PRNGKey(0), jnp.asarray(tok.blank(1)), jnp.asarray(tok.types))["params"]
+    idx = np.arange(8)
+    x, tgt, mask = make_batch(tok, M, d, idx)
+    nb = cons_batch(tok, M, d, idx[:4])
+    to_j = lambda t: jax.tree_util.tree_map(jnp.asarray, t)
+
+    for key in C.ALL:
+        lc = LossConfig(mc=True, cons=True, cons_loss=key, cons_batch=4)
+        opt = optax.adam(1e-3)
+        step = make_step(model, tok, opt, lc)
+        _, _, parts = step(p0, opt.init(p0), jnp.asarray(x), jnp.asarray(tgt), jnp.asarray(mask),
+                           to_j(value_batch(M, d, idx[:4])), to_j(nb), jnp.float32(1.0))
+        assert {"tf", "mc", "cons", "cond_gap", "info_gain"} <= set(parts), (key, sorted(parts))
+        assert all(np.isfinite(float(v)) for v in parts.values()), key
+
+    # cons_warmup gate: cons_on = 0 leaves the update identical to the same config with no consistency term
+    lc = LossConfig(mc=True, cons=True, cons_loss="all_scaled", cons_batch=4)
+    opt = optax.adam(1e-3)
+    args = (jnp.asarray(x), jnp.asarray(tgt), jnp.asarray(mask), to_j(value_batch(M, d, idx[:4])))
+    off, _, _ = make_step(model, tok, opt, lc)(p0, opt.init(p0), *args, to_j(nb), jnp.float32(0.0))
+    plain, _, _ = make_step(model, tok, opt, LossConfig(mc=True))(p0, opt.init(p0), *args, {}, jnp.float32(0.0))
+    for a, b in zip(jax.tree_util.tree_leaves(off), jax.tree_util.tree_leaves(plain)):
+        assert np.allclose(a, b, atol=1e-6)
+
+
 if __name__ == "__main__":
     for k, v in list(globals().items()):
         if k.startswith("test_"):

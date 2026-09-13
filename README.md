@@ -38,6 +38,22 @@ Losses over all n(n+1)/2 intervals: `local`, `all` (the 2(n+1)/n * Var(c) shortc
 `python tests/test_consistency.py` checks the fast forms against explicit interval enumeration in both
 values and gradients.
 
+Training with one: `LossConfig(mc=True, cons=True, cons_loss="all_scaled", w_cons=0.14)`. The term runs on its
+own batch of `cons_batch` rollouts tokenized in both modes and is added into the main gradient, so the data
+loss is untouched and a consistency run differs from its baseline by exactly that one term. `cond_gap` and
+`info_gain` are logged beside it as the collapse check -- every one of these objectives is minimized by
+ignoring R entirely (`v == u`, `b` flat in `t`), so a falling consistency loss is only good news while those
+two hold up.
+
+```
+python run.py cons-sweep 3000   # mc baseline vs every consistency loss -> runs/cons/
+python run.py cons-plot         # test curves + collapse diagnostics
+```
+
+`colab/consistency_sweep.ipynb` is the same comparison on a GPU, writing to Drive. Each objective gets its own
+`lambda_cons` (`experiments.CONS_LAMBDA`) chosen for roughly equal gradient pull, since raw `all` and
+`poly_len` sit ~100x above the scaled family in loss value.
+
 ## Maze and returns
 
 `data/canonical/maze.txt` is the layout, hand-edited; the build reads it and never overwrites it.

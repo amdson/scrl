@@ -9,6 +9,8 @@
   python run.py value-eval [name]      # value head's E[R] vs the exact E[R] on every test-set prefix
   python run.py sweep [steps]          # train base / mc / td / mc_a4 / td_a4 with exact-test tracking -> runs/sweep/
   python run.py sweep-plot             # test-metric curves for the sweep -> runs/sweep/curves.png
+  python run.py cons-sweep [steps]     # mc baseline vs every interval consistency loss -> runs/cons/
+  python run.py cons-plot              # test curves + consistency diagnostics -> runs/cons/
 """
 import sys
 
@@ -105,6 +107,16 @@ def main():
     elif cmd == "sweep":
         from maze_consistency.experiments import SweepConfig, run_sweep
         run_sweep(SweepConfig(steps=int(sys.argv[2])) if len(sys.argv) > 2 else SweepConfig())
+    elif cmd == "cons-sweep":
+        from maze_consistency.experiments import SweepConfig, CONS_SWEEP, run_sweep
+        sc = SweepConfig(configs=CONS_SWEEP, prefix="cons",
+                         steps=int(sys.argv[2]) if len(sys.argv) > 2 else 3000)
+        run_sweep(sc)
+    elif cmd == "cons-plot":
+        from maze_consistency.experiments import plot_sweep, plot_cons_diagnostics
+        plot_sweep("cons")
+        plot_cons_diagnostics("cons")
+        print("wrote runs/cons/curves.png and runs/cons/cons_diagnostics.png")
     elif cmd == "sweep-plot":
         from maze_consistency.experiments import plot_sweep
         plot_sweep()

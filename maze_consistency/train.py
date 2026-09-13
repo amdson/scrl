@@ -4,6 +4,12 @@ bin) and always trains the teacher-forced next-token loss. LossConfig adds value
   mc   Monte Carlo value:  CE( V_t , one-hot(outcome bin) ) at every NOR state slot t <= L         (main step)
   td   identity (B):       CE( V_t , sg[ w_t * V_{t+1} ] ), w_t = pi(a_t | h_t) / (1/4) clipped at 4;
                            the last step uses the known outcome                                      (main step)
+  cons interval consistency: lambda_cons * L_cons on its own batch of cons_batch rollouts, run in BOTH modes
+                           (NOR and the rollout's own bin) so the two orderings share a trajectory. Added into
+                           the main gradient, not a separate update. The data loss is untouched, so a cons run
+                           and its baseline see an identical data objective and differ only by this term.
+                           cons_loss picks the objective from consistency.ALL.       (main step)
+
   a    identity (A):       CE( pi_R(. | h_t, k) , sg[ pi(a | h_t) V_{t+1}(k | h_t, a) / sum_a' ... ] ) for one
                            random step t and bin k per rollout, children from the maze table. Runs as its own
                            a_updates gradient steps per training step, each on a_batch fresh rollouts, with a
@@ -28,6 +34,7 @@ from .dataset import load
 from .env import N_ACTIONS
 from .tokens import Tokenizer
 from .model import ModelConfig, MazeTransformer, make_forward, next_token_loss, count_params
+from . import consistency as C
 
 N_HELDOUT = 1000          # the last rollouts of the dataset are held out for evaluation
 RUNS_DIR = os.environ.get("RUNS_DIR", "runs")   # set RUNS_DIR (e.g. a Drive folder on Colab) to redirect outputs
@@ -45,10 +52,19 @@ class LossConfig:
     a_batch: int = 16         # fresh rollouts per A step (one state and one bin each)
     lr_a: float = 1e-4        # A has its own Adam at this rate; the main loss uses train(lr=...)
     a_warmup: float = 0.25    # fraction of training before the A steps start
+    cons: bool = False        # interval consistency loss, added into the main gradient
+    cons_loss: str = "all_scaled"   # which objective: any key of consistency.ALL
+    w_cons: float = 0.1       # lambda_cons
+    cons_batch: int = 16      # rollouts per step; each costs two forward passes (NOR and R)
+    cons_warmup: float = 0.0  # fraction of training before the consistency term switches on
 
     @property
     def main_value(self) -> bool:
         return self.mc or self.td
+
+    def __post_init__(self):
+        if self.cons and self.cons_loss not in C.ALL:
+            raise ValueError(f"cons_loss={self.cons_loss!r} not in {sorted(C.ALL)}")
 
 
 def make_batch(tok: Tokenizer, maze, d, idx, p_nor=0.5):
@@ -65,6 +81,11 @@ def value_batch(maze, d, idx):
     L, reached = d["length"][idx].astype(np.int64), d["reached"][idx]
     return dict(act=d["actions"][idx].astype(np.int32), L=L.astype(np.int32),
                 term_bin=maze.outcome_bin(L, reached).astype(np.int32))
+
+
+def cons_batch(tok: Tokenizer, maze, d, idx):
+    """Host-side inputs for the consistency term: the same rollouts tokenized in both modes."""
+    return C.rollout_batch(tok, maze, d, idx)
 
 
 def a_batch(tok: Tokenizer, maze, d, idx, rng):
@@ -92,16 +113,27 @@ def a_batch(tok: Tokenizer, maze, d, idx, rng):
 
 
 def make_step(model, tok: Tokenizer, opt, lc: LossConfig):
-    """Main step: next-token loss plus the MC / TD value terms on the NOR half."""
+    """Main step: next-token loss, the MC / TD value terms on the NOR half, and the consistency term."""
     types, sidx = jnp.asarray(tok.types), jnp.asarray(tok.sidx)
     T, K = tok.T, tok.K
+    terms = C.make_terms_fn(model, tok, jit=False) if lc.cons else None
 
-    def loss_fn(p, x, tgt, mask, cb):
+    def cons_term(p, nb):
+        """lambda_cons * L_cons on its own batch, both modes on the same rollouts."""
+        t = terms(p, nb["x_nor"], nb["x_R"], nb["targets"], nb["R_bin"])
+        r = C.residuals(t["u"], t["v"], t["b"], nb["lengths"])
+        dg = C.diagnostics(r, t["u"], t["v"], t["b"])
+        # cond_gap and info_gain are the collapse check: the degenerate optimum of every consistency loss is
+        # "ignore R" (v == u, b flat in t), which drives both to 0 while L_cons falls. Logged, never optimized.
+        return C.ALL[lc.cons_loss](r).mean(), dict(cond_gap=dg["cond_gap"].mean(),
+                                                   info_gain=dg["info_gain"].mean())
+
+    def loss_fn(p, x, tgt, mask, cb, nb, cons_on):
         out = model.apply({"params": p}, x, types)
         tf = next_token_loss(out["next"], tgt, mask)
         total, parts = tf, dict(tf=tf)
         if not lc.main_value:
-            return total, parts
+            return add_cons(p, total, parts, nb, cons_on) if lc.cons else (total, parts)
         n = cb["L"].shape[0]
         logV = jax.nn.log_softmax(out["value"][:n][:, sidx], -1)                   # [n, T+1, K]
         if lc.mc:
@@ -120,11 +152,16 @@ def make_step(model, tok: Tokenizer, opt, lc: LossConfig):
             td = -(w[..., None] * v_next * logV[:, :T]).sum(-1)
             td = (td * valid).sum() / valid.sum()
             total, parts["td"] = total + lc.w_td * td, td
-        return total, parts
+        return add_cons(p, total, parts, nb, cons_on) if lc.cons else (total, parts)
+
+    def add_cons(p, total, parts, nb, cons_on):
+        cons, diag = cons_term(p, nb)
+        parts.update(cons=cons, **diag)
+        return total + lc.w_cons * cons_on * cons, parts
 
     @jax.jit
-    def step(params, opt_state, x, tgt, mask, cb):
-        (loss, parts), g = jax.value_and_grad(loss_fn, has_aux=True)(params, x, tgt, mask, cb)
+    def step(params, opt_state, x, tgt, mask, cb, nb, cons_on):
+        (loss, parts), g = jax.value_and_grad(loss_fn, has_aux=True)(params, x, tgt, mask, cb, nb, cons_on)
         u, opt_state = opt.update(g, opt_state, params)
         return optax.apply_updates(params, u), opt_state, parts
 
@@ -200,7 +237,10 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
         idx = rng.integers(0, n_train, batch)
         x, tgt, mask = make_batch(tok, maze, d, idx)
         cb = value_batch(maze, d, idx[:n_nor]) if lc.main_value else {}
-        params, opt_state, parts = step(params, opt_state, jnp.asarray(x), jnp.asarray(tgt), jnp.asarray(mask), to_jnp(cb))
+        nb = cons_batch(tok, maze, d, rng.integers(0, n_train, lc.cons_batch)) if lc.cons else {}
+        cons_on = float(lc.cons and i > lc.cons_warmup * steps)
+        params, opt_state, parts = step(params, opt_state, jnp.asarray(x), jnp.asarray(tgt), jnp.asarray(mask),
+                                        to_jnp(cb), to_jnp(nb), jnp.float32(cons_on))
         for k, v in parts.items():
             recent.setdefault(k, []).append(float(v))
         if lc.a and i > lc.a_warmup * steps:

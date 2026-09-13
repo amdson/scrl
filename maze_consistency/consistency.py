@@ -206,8 +206,9 @@ def interval_stats_by_length(c, lengths, max_pairs=None):
 
 # ---- getting u, v, b out of the model ----------------------------------------------------------
 
-def make_terms_fn(model, tok):
-    """jit'd (params, x_nor, x_R, targets, R_bin) -> dict of [B, T] / [B, T+1] arrays.
+def make_terms_fn(model, tok, jit=True):
+    """(params, x_nor, x_R, targets, R_bin) -> dict of [B, T] / [B, T+1] arrays; jit'd unless jit=False
+    (pass jit=False to call it inside another jit'd loss, as train.make_step does).
 
     x_nor and x_R are the same rollout bodies with MODE = NOR and MODE = R; targets comes from
     tok.next_targets (identical for both, it only reads the body). Nothing is detached: gradients flow into
@@ -220,7 +221,6 @@ def make_terms_fn(model, tok):
         lp = jax.nn.log_softmax(next_logits[:, :-1].astype(jnp.float32), -1)
         return jnp.take_along_axis(lp, jnp.maximum(targets, 0)[..., None], -1)[..., 0]
 
-    @jax.jit
     def terms(params, x_nor, x_R, targets, R_bin):
         out_n = model.apply({"params": params}, x_nor, types)
         out_r = model.apply({"params": params}, x_R, types)
@@ -234,7 +234,7 @@ def make_terms_fn(model, tok):
                     u_pi=u_pi, u_dyn=u_dyn, v_pi=v_pi, v_dyn=v_dyn, logq=logq,
                     lp_nor=lp_n, lp_R=lp_r)      # every slot, so the data loss can reuse these two passes
 
-    return terms
+    return jax.jit(terms) if jit else terms
 
 
 def rollout_batch(tok, maze, d, idx):
