@@ -24,3 +24,10 @@ def test_expected_return():
     r = np.flatnonzero(d["reached"])[:100]
     assert np.allclose(ev[r, d["length"][r]], m.gamma ** d["length"][r])      # arrived: E[R] = gamma**L
     assert np.isnan(ev[r, -1][d["length"][r] < m.T]).all()
+
+
+if __name__ == "__main__":
+    for k, v in list(globals().items()):
+        if k.startswith("test_"):
+            v()
+            print("ok", k)
