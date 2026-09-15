@@ -71,8 +71,10 @@ DP, where every loss is 0, so the sweep's held-out `cons/` curves are absolute.
 feeds the spliced trajectories back into training. It targets the coverage gap directly: of 66,609 far-start
 random walks, none achieved their start's best outcome, so there was nothing to imitate.
 
-- Continuations step the real maze (`maze.next_open`), not the dynamics head, so every spliced trajectory is
-  a genuine environment trajectory under a behaviour policy that switches at `tau`.
+- Continuations are imagined: actions from the R-conditioned policy, next cells from the model's own dynamics
+  head in NOR mode (the unconditioned world model). No environment interaction produces the data. The real
+  maze only counts imagined moves it would not allow -- reported among the rollouts that improved, since
+  asking for high reward selects for helpful world-model errors. `dynamics="env"` is the online upper bound.
 - R is relabelled to the bin achieved, never the bin requested.
 - Every head trains on the mixture (`train(mixer=RolloutBuffer(...), mix_frac=...)`). The interval identity is
   about one joint distribution; rollouts in the R head alone would make the heads disagree about it.

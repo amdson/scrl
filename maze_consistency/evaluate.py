@@ -61,6 +61,18 @@ def make_action_logits(model, tok: Tokenizer):
     return f
 
 
+def make_cell_logits(model, tok: Tokenizer):
+    """jit'd (params, x, i) -> next-cell logits at slot i (an action slot): the model's own world model."""
+    types = jnp.asarray(tok.types)
+
+    @jax.jit
+    def f(params, x, i):
+        out = model.apply({"params": params}, x, types[: x.shape[1]])["next"]
+        return out[:, i, tok.OUT_CELL0:tok.OUT_END]
+
+    return f
+
+
 def rollout(params, action_logits, tok: Tokenizer, maze, mode_bins, starts, rng, greedy=False, bucket=64):
     """The model acts in the real maze from `starts`. mode_bins [N]: an outcome bin per rollout, or -1 for NOR.
     Each step re-encodes the prefix, cropped to a multiple of `bucket` slots to limit recompiles."""
@@ -106,14 +118,20 @@ def _trajectory(tok: Tokenizer, maze, x, starts, length, reached):
 
 
 def continue_rollout(params, action_logits, tok: Tokenizer, maze, positions, actions, tau, mode_bins, rng,
-                     greedy=False, bucket=64):
-    """Continue real trajectories from their prefixes h_tau, with the model acting in the REAL maze.
+                     greedy=False, bucket=64, cell_logits=None):
+    """Continue real trajectories from their prefixes h_tau.
 
     positions [N, T+1] / actions [N, T]: source trajectories in the dataset's layout. tau [N]: the switch time
     per row -- each source must still be running at tau (tau < its length). mode_bins [N]: MODE for the
-    continuation (-1 = NOR). Steps before tau are copied verbatim; from tau on the model picks the actions and
-    maze.next_open applies them, so the result is a genuine environment trajectory whose behaviour policy
-    switches at tau. Returns the same dict as rollout()."""
+    continuation's actions (-1 = NOR). Steps before tau are copied verbatim.
+
+    cell_logits (make_cell_logits) makes the continuation IMAGINED: the next cell is sampled from the model's
+    own dynamics head, read in NOR mode -- the unconditioned world model p(s' | h, a). Conditioning the
+    dynamics on a requested high R would bias it toward lucky transitions (note section 7), and asking for high
+    R selects for exactly those. The real maze is then used only to count transitions it would not allow
+    (n_bad), never to produce the data. cell_logits=None steps the real maze instead: online interaction.
+
+    Returns the same dict as rollout(), plus n_bad [N]."""
     positions, actions = np.asarray(positions), np.asarray(actions)
     tau, mode_bins = np.asarray(tau).astype(np.int64), np.asarray(mode_bins)
     N, T = len(tau), maze.T
@@ -123,6 +141,7 @@ def continue_rollout(params, action_logits, tok: Tokenizer, maze, positions, act
     assert (pos != maze.goal).all(), "every source trajectory must still be running at its tau"
     length = np.full(N, T, dtype=np.int64)
     alive = np.ones(N, dtype=bool)                   # rows before their tau are alive but not yet acting
+    bad = np.zeros(N, dtype=np.int64)
     for t in range(int(tau.min()), T):
         act = alive & (t >= tau)
         if not act.any():
@@ -132,15 +151,28 @@ def continue_rollout(params, action_logits, tok: Tokenizer, maze, positions, act
         lg = np.asarray(action_logits(params, jnp.asarray(x[:, :Lb]), si))
         p = np.exp(_log_softmax(lg))
         a = p.argmax(-1) if greedy else np.minimum((rng.random(N)[:, None] > p.cumsum(-1)).sum(-1), N_ACTIONS - 1)
-        pos = np.where(act, maze.next_open[pos, a], pos)
         x[act, si + 1] = tok.act(a[act])
+        true_next = maze.next_open[pos, a]
+        if cell_logits is None:
+            nxt = true_next
+        else:
+            Lc = min(tok.L, ((si + 1) // bucket + 1) * bucket)
+            xn = x[:, :Lc].copy()
+            xn[:, 0] = tok.mode(None)                # NOR: the unconditioned world model
+            pc = np.exp(_log_softmax(np.asarray(cell_logits(params, jnp.asarray(xn), si + 1)).astype(np.float64)))
+            nxt = pc.argmax(-1) if greedy else np.minimum((rng.random(N)[:, None] > pc.cumsum(-1)).sum(-1),
+                                                          maze.n_cells - 1)
+            bad += act & (nxt != true_next)          # diagnostic only -- the data never sees true_next
+        pos = np.where(act, nxt, pos)
         x[act, si + 2] = tok.pos(pos[act])
         arrived = act & (pos == maze.goal)
         length[arrived] = t + 1
         alive &= ~arrived
         if not alive.any():
             break
-    return _trajectory(tok, maze, x, positions[:, 0], length, ~alive)
+    out = _trajectory(tok, maze, x, positions[:, 0], length, ~alive)
+    out["n_bad"] = bad
+    return out
 
 
 def return_sweep(params, model, tok: Tokenizer, maze, n_per=64, seed=0, greedy=False):

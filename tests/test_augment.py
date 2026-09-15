@@ -1,4 +1,5 @@
-"""Spliced model rollouts: the prefix is kept, the dynamics are the real maze, R is the achieved bin."""
+"""Spliced model rollouts: the prefix is kept, R is the achieved bin, and imagined dynamics read the model's
+world model at the right slot -- a perfect world model reproduces the real maze exactly."""
 import os
 import sys
 import tempfile
@@ -11,7 +12,7 @@ from maze_consistency.dataset import load
 from maze_consistency.tokens import Tokenizer
 from maze_consistency.model import ModelConfig, MazeTransformer
 from maze_consistency.dp import compute_ground_truth
-from maze_consistency.evaluate import make_action_logits, continue_rollout
+from maze_consistency.evaluate import make_action_logits, make_cell_logits, continue_rollout
 from maze_consistency.augment import splice, summarize, RolloutBuffer
 from maze_consistency.train import train, LossConfig, N_HELDOUT
 
@@ -40,6 +41,34 @@ def test_continue_rollout_keeps_prefix_and_real_dynamics():
         assert bool(ro["reached"][i]) == (ro["positions"][i, L] == MAZE.goal)
 
 
+def oracle_cells(params, x, i):
+    """A perfect world model: one-hot on maze.next_open for the state at slot i-1 and the action at slot i."""
+    x = np.asarray(x)
+    s = np.minimum(x[:, i - 1, 1] + x[:, i - 1, 2] * MAZE.W, MAZE.n_cells - 1)
+    a = np.clip(x[:, i, 0] - TOK.ACT0, 0, 3)
+    lg = np.full((x.shape[0], MAZE.n_cells), -1e9)
+    lg[np.arange(len(s)), MAZE.next_open[s, a]] = 0.0
+    return lg
+
+
+def test_imagined_dynamics_read_the_right_slots_and_count_hallucinations():
+    rng = np.random.default_rng(4)
+    idx = rng.choice(np.flatnonzero(D["length"][POOL] > 30), 6)
+    tau = np.array([0, 3, 8, 15, 22, 29])
+    args = (TOK, MAZE, D["positions"][idx], D["actions"][idx], tau, np.full(6, MAZE.K - 1))
+    # a perfect world model must reproduce the real maze: no impossible move anywhere
+    ro = continue_rollout(P, AL, *args, rng, cell_logits=oracle_cells)
+    assert (ro["n_bad"] == 0).all()
+    # the real (untrained) world model: prefix kept, and n_bad counts exactly the impossible moves after tau
+    ro = continue_rollout(P, AL, *args, rng, cell_logits=make_cell_logits(MODEL, TOK))
+    for i in range(6):
+        t0, L = int(tau[i]), int(ro["length"][i])
+        assert (ro["positions"][i, :t0 + 1] == D["positions"][idx[i], :t0 + 1]).all()
+        wrong = sum(ro["positions"][i, t + 1] != MAZE.next_open[ro["positions"][i, t], ro["actions"][i, t]]
+                    for t in range(t0, L))
+        assert wrong == ro["n_bad"][i], (i, wrong, ro["n_bad"][i])
+
+
 def test_splice_relabels_and_asks_for_more():
     gt = compute_ground_truth(MAZE)
     rng = np.random.default_rng(1)
@@ -60,12 +89,15 @@ def test_uniform_policy_matches_exact_random_walk_baseline():
     dynamics, relabelling, and the h[tau, s_tau] bookkeeping at once."""
     gt = compute_ground_truth(MAZE)
     uniform = lambda params, x, i: jnp.zeros((x.shape[0], 4))
-    b = splice(None, uniform, TOK, MAZE, D, POOL, 800, np.random.default_rng(3), tau_max=100, gt=gt)
-    for hit, p in (((b["achieved"] > b["orig_bin"]), b["p_improve_rw"]),
-                   ((b["achieved"] >= b["requested"]), b["p_request_rw"])):
-        diff = hit.mean() - p.mean()
-        se = np.sqrt((p * (1 - p)).mean() / len(p))
-        assert abs(diff) < 4 * se + 1e-3, (float(hit.mean()), float(p.mean()), float(se))
+    for cells in (None, oracle_cells):                       # the real maze, and a perfect imagined one
+        b = splice(None, uniform, TOK, MAZE, D, POOL, 800, np.random.default_rng(3), tau_max=100, gt=gt,
+                   cell_logits=cells)
+        assert (b["n_bad"] == 0).all()
+        for hit, p in (((b["achieved"] > b["orig_bin"]), b["p_improve_rw"]),
+                       ((b["achieved"] >= b["requested"]), b["p_request_rw"])):
+            diff = hit.mean() - p.mean()
+            se = np.sqrt((p * (1 - p)).mean() / len(p))
+            assert abs(diff) < 4 * se + 1e-3, (float(hit.mean()), float(p.mean()), float(se))
 
 
 def test_train_mixes_rollouts_and_refuses_td():
