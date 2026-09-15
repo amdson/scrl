@@ -65,6 +65,25 @@ session; `experiments.py` is the packaged equivalent behind the CLI. Each object
 scaled family in loss value. `consistency.exact_terms` gives the same quantities for the true model from the
 DP, where every loss is 0, so the sweep's held-out `cons/` curves are absolute.
 
+## Model rollouts as training data
+
+`augment.py` continues real prefixes with the model, asking for more reward than the original achieved, and
+feeds the spliced trajectories back into training. It targets the coverage gap directly: of 66,609 far-start
+random walks, none achieved their start's best outcome, so there was nothing to imitate.
+
+- Continuations step the real maze (`maze.next_open`), not the dynamics head, so every spliced trajectory is
+  a genuine environment trajectory under a behaviour policy that switches at `tau`.
+- R is relabelled to the bin achieved, never the bin requested.
+- Every head trains on the mixture (`train(mixer=RolloutBuffer(...), mix_frac=...)`). The interval identity is
+  about one joint distribution; rollouts in the R head alone would make the heads disagree about it.
+- The DP ground truth describes the random walk, so `act_kl` / `value_kl` for rollout-trained runs are
+  references for a different distribution. `RolloutBuffer.history` is the readout that stays valid: asked for
+  a higher reward from a real prefix, how often does the model get one, against the exact random-walk rate
+  from the same prefixes.
+- `td` is refused with a mixer: its importance weight assumes the uniform behaviour policy.
+
+`colab/rollouts.ipynb` runs `{mc, mc_all} x {data only, + rollouts}`.
+
 ## Outcome binning
 
 `Maze(binning=...)` chooses how arrival time L is partitioned into the K value-head bins.

@@ -75,6 +75,12 @@ class LossConfig:
             raise ValueError(f"cons_detach={self.cons_detach!r} not in none|b|uv|u")
 
 
+def merge_rows(d, idx, extra):
+    """Dataset rows idx followed by `extra`, a dict in the same layout (e.g. augment.RolloutBuffer.rows)."""
+    return {k: np.concatenate([d[k][idx], np.asarray(extra[k]).astype(d[k].dtype)])
+            for k in ("positions", "actions", "length", "reached")}
+
+
 def make_batch(tok: Tokenizer, maze, d, idx, p_nor=0.5):
     """First round(p_nor * B) rows in NOR mode, the rest with MODE = the rollout's own outcome bin."""
     body = tok.encode_body(d["positions"][idx], d["actions"][idx], d["length"][idx])
@@ -215,9 +221,15 @@ def make_a_step(model, tok: Tokenizer, opt_a):
 
 def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_heads=4, seed=0,
           loss: LossConfig | None = None, consistency=False, a_warmup=None,
-          eval_fn=None, eval_every=0, log_every=100, log=print, cons_sampler=None, maze_kw=None):
+          eval_fn=None, eval_every=0, log_every=100, log=print, cons_sampler=None, maze_kw=None,
+          mixer=None, mix_frac=0.0):
     """loss: a LossConfig (default: next-token only). consistency=True is shorthand for LossConfig(td=True, a=True).
     eval_fn(params, fwd) -> dict of metrics, called at step 0, every eval_every steps, and at the end.
+
+    mixer / mix_frac: an object with maybe_refresh(params, step), ready and rows(rng, n) -- see
+    augment.RolloutBuffer -- supplying model-generated trajectories. Once ready, mix_frac of every main batch
+    and every consistency batch comes from it, shuffled across the NOR and R halves, so all heads learn the
+    same mixed joint. Without a mixer the data order is exactly what it was.
 
     maze_kw is forwarded to dataset.load, so a run can use a different outcome binning (n_bins / binning)
     without touching the stored rollouts. Its exact test set has to be rebuilt to match.
@@ -229,6 +241,9 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
     lc = loss or (LossConfig(td=True, a=True) if consistency else LossConfig())
     if a_warmup is not None:
         lc = replace(lc, a_warmup=a_warmup)
+    if mixer is not None and lc.td:
+        raise ValueError("td's importance weight assumes the uniform behaviour policy, which model-generated "
+                         "rows do not follow -- use mc (or a) with a mixer")
     maze, d = load(**(maze_kw or {}))      # maze_kw={"binning": ..., "n_bins": ...} relabels outcomes only
     tok = Tokenizer(maze)
     n_train = len(d["length"]) - N_HELDOUT
@@ -257,13 +272,24 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
     n_nor = batch // 2
     to_jnp = lambda tree: jax.tree_util.tree_map(jnp.asarray, tree)
     for i in range(1, steps + 1):
-        idx = rng.integers(0, n_train, batch)
-        x, tgt, mask = make_batch(tok, maze, d, idx)
-        cb = value_batch(maze, d, idx[:n_nor]) if lc.main_value else {}
+        if mixer is not None:
+            mixer.maybe_refresh(params, i)
+        n_mix = int(round(mix_frac * batch)) if mixer is not None and mixer.ready else 0
+        idx = rng.integers(0, n_train, batch - n_mix)
+        if n_mix:                                    # rollout rows land in both the NOR and the R half
+            src, bidx = merge_rows(d, idx, mixer.rows(rng, n_mix)), rng.permutation(batch)
+        else:
+            src, bidx = d, idx
+        x, tgt, mask = make_batch(tok, maze, src, bidx)
+        cb = value_batch(maze, src, bidx[:n_nor]) if lc.main_value else {}
         if not lc.cons:
             nb = {}
         elif cons_sampler is not None:
             nb = cons_sampler(params, rng, lc.cons_batch, i)
+        elif n_mix:
+            n_c = int(round(mix_frac * lc.cons_batch))
+            csrc = merge_rows(d, rng.integers(0, n_train, lc.cons_batch - n_c), mixer.rows(rng, n_c))
+            nb = cons_batch(tok, maze, csrc, np.arange(lc.cons_batch))
         else:
             nb = cons_batch(tok, maze, d, rng.integers(0, n_train, lc.cons_batch))
         cons_on = float(lc.cons and i > lc.cons_warmup * steps)

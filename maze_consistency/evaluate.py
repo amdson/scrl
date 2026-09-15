@@ -87,18 +87,60 @@ def rollout(params, action_logits, tok: Tokenizer, maze, mode_bins, starts, rng,
         alive &= ~arrived
         if not alive.any():
             break
-    reached = ~alive
-    # positions / actions in the dataset's layout, so a rollout batch can be fed straight to
-    # consistency.rollout_batch or Tokenizer.encode_body.
+    return _trajectory(tok, maze, x, starts, length, ~alive)
+
+
+def _trajectory(tok: Tokenizer, maze, x, starts, length, reached):
+    """Read a finished rollout's token buffer back into the dataset's layout, so it can be fed straight to
+    consistency.rollout_batch, Tokenizer.encode_body, or mixed into training batches."""
+    N, T = len(length), maze.T
     positions = np.zeros((N, T + 1), dtype=np.int32)
     positions[:, 0] = starts
     positions[:, 1:] = x[:, tok.sidx[1:], 1] + x[:, tok.sidx[1:], 2] * maze.W
     actions = x[:, tok.aidx, 0].astype(np.int8) - tok.ACT0
     steps = np.arange(T)[None, :] < length[:, None]
-    positions[:, 1:] = np.where(steps, positions[:, 1:], maze.goal)
+    positions[:, 1:] = np.where(steps, positions[:, 1:], maze.goal)          # frozen at the goal after arrival
     return dict(starts=starts, length=length, reached=reached, returns=maze.return_of(length, reached),
                 bins=maze.outcome_bin(length, reached),
                 positions=positions, actions=np.where(steps, actions, 0))
+
+
+def continue_rollout(params, action_logits, tok: Tokenizer, maze, positions, actions, tau, mode_bins, rng,
+                     greedy=False, bucket=64):
+    """Continue real trajectories from their prefixes h_tau, with the model acting in the REAL maze.
+
+    positions [N, T+1] / actions [N, T]: source trajectories in the dataset's layout. tau [N]: the switch time
+    per row -- each source must still be running at tau (tau < its length). mode_bins [N]: MODE for the
+    continuation (-1 = NOR). Steps before tau are copied verbatim; from tau on the model picks the actions and
+    maze.next_open applies them, so the result is a genuine environment trajectory whose behaviour policy
+    switches at tau. Returns the same dict as rollout()."""
+    positions, actions = np.asarray(positions), np.asarray(actions)
+    tau, mode_bins = np.asarray(tau).astype(np.int64), np.asarray(mode_bins)
+    N, T = len(tau), maze.T
+    x = tok.with_mode(tok.encode_body(positions, actions, tau), np.maximum(mode_bins, 0))
+    x[mode_bins < 0, 0] = tok.mode(None)
+    pos = positions[np.arange(N), tau].astype(np.int64)
+    assert (pos != maze.goal).all(), "every source trajectory must still be running at its tau"
+    length = np.full(N, T, dtype=np.int64)
+    alive = np.ones(N, dtype=bool)                   # rows before their tau are alive but not yet acting
+    for t in range(int(tau.min()), T):
+        act = alive & (t >= tau)
+        if not act.any():
+            continue
+        si = int(tok.sidx[t])
+        Lb = min(tok.L, (si // bucket + 1) * bucket)
+        lg = np.asarray(action_logits(params, jnp.asarray(x[:, :Lb]), si))
+        p = np.exp(_log_softmax(lg))
+        a = p.argmax(-1) if greedy else np.minimum((rng.random(N)[:, None] > p.cumsum(-1)).sum(-1), N_ACTIONS - 1)
+        pos = np.where(act, maze.next_open[pos, a], pos)
+        x[act, si + 1] = tok.act(a[act])
+        x[act, si + 2] = tok.pos(pos[act])
+        arrived = act & (pos == maze.goal)
+        length[arrived] = t + 1
+        alive &= ~arrived
+        if not alive.any():
+            break
+    return _trajectory(tok, maze, x, positions[:, 0], length, ~alive)
 
 
 def return_sweep(params, model, tok: Tokenizer, maze, n_per=64, seed=0, greedy=False):
