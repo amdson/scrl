@@ -1,8 +1,13 @@
 # Model-based rollout augmentation: status
 
-**State:** implemented, tested, pushed to `main` (`b990a16`, then `be0f34e`). Not yet run at scale. Two
-known issues (sections 8 and 9) are worth deciding before the scaled run, because both shrink the effect the
-run is meant to measure.
+**State:** the current revision removes oracle information from training. Previous versions (`b990a16`,
+`be0f34e`) used real transitions or exact shortest-path distances to generate/select training data. Those
+paths are now removed or refused. Measurements below describe the old selection rule; rerun with the new
+`rollouts_offline` notebook prefix before comparing results.
+
+**Goal:** generate optimal paths by learning from non-optimal offline trajectories. Training must discover
+useful compositions itself; no optimal-path selection, exact-distance feasibility checks, or real-maze
+interaction supplies its targets. The real maze is available for evaluation only.
 
 ## 1. Why
 
@@ -43,18 +48,22 @@ A `RolloutBuffer` holds the spliced trajectories and regenerates them from the c
 
 ## 3. Design decisions
 
-**Continuations are imagined, not stepped in the real maze.** The first version (`b990a16`) stepped the real
-maze for the continuations. That's online interaction, i.e. on-policy data collection. It isn't model-based,
-and it isn't the offline setting the rest of the project works in. `be0f34e` fixed this. `dynamics="env"`
-still exists, explicitly labelled as an online upper bound for measuring how much the world model's errors
-cost.
+**Continuations are imagined.** `splice` requires learned `cell_logits`; `RolloutBuffer(dynamics="env")`
+is refused. Real-maze rollouts remain in `evaluate.py` for evaluation and must not enter training.
+
+**Requests do not use optimal distances.** `request="above"` samples uniformly from bins above the recorded
+outcome through K-1. `request="highest"` always asks for K-1 (`"best"` is a legacy alias with this new meaning).
+Only prefixes already finished or rows already labelled K-1 are resampled. Requests may be infeasible; all
+generated outcomes are kept. No distance or reachability calculation clips requests or selects training rows.
 
 **Next cells come from the dynamics head read in NOR mode**, the unconditioned world model `p(s' | h, a)`.
 Conditioning the dynamics on a high requested reward would bias it toward lucky transitions
 (`consistency_losses.md` section 7), and asking for high reward selects for exactly those.
 
-**The real maze is used only as a diagnostic.** It counts imagined moves it wouldn't allow (`n_bad`) and never
-produces data.
+**The real maze is used only for evaluation.** After generation, `evaluate.rollout_diagnostics` counts
+impossible moves, computes exact random-walk baselines, and measures far-start best-bin attainment. These
+results never filter or modify training rows. Generation uses task definitions (dimensions, goal, horizon,
+reward bins), without consulting the maze layout, transition table, or optimal-distance map.
 
 **Relabel to the achieved bin, never the requested one.** Asking shapes which states get visited; the label
 follows what happened.
@@ -69,7 +78,9 @@ batch.
 `tau`. Drawing `tau ~ U(0, L)` would make the switch point depend on how long the original ran.
 
 **`td` is refused with a mixer.** Its importance weight assumes the uniform random-walk behaviour policy,
-which rollout rows don't follow. `mc` and identity (A) are fine.
+which rollout rows don't follow. Use `mc` with optional interval consistency. The separate legacy `a`
+objective built child states from real transitions and is disabled, even without a mixer.
+`train(consistency=True)` now selects MC plus interval consistency.
 
 ## 4. Code
 
@@ -78,16 +89,25 @@ which rollout rows don't follow. `mc` and identity (A) are fine.
 | `evaluate.continue_rollout` | continues trajectories from per-row prefixes; imagined dynamics when given `cell_logits` |
 | `evaluate.make_cell_logits` | next-cell logits at an action slot (the world model) |
 | `evaluate._trajectory` | reads a token buffer back into dataset layout; shared with `rollout` |
-| `augment.splice` | picks prefixes, requests a higher bin, continues, relabels, records exact random-walk baselines |
+| `augment.splice` | picks recorded prefixes, requests a higher configured bin, imagines and relabels |
+| `evaluate.rollout_diagnostics` | evaluates completed splices with exact transitions, distances, and DP baselines |
 | `augment.summarize` | per-refresh behavioural readout (section 6) |
 | `augment.RolloutBuffer` | the pool; duck-typed for `train(mixer=...)` |
 | `train(mixer=, mix_frac=)`, `merge_rows` | mixes rollout rows into the main and consistency batches |
-| `tests/test_augment.py` | 5 tests (section 5) |
+| `tests/test_augment.py` | generation, evaluation, offline-boundary, and training tests (section 5) |
 | `colab/rollouts.ipynb` | the 2x2 experiment (section 6) |
 
 With no mixer, training is unchanged: a baseline run reproduces `mc 1.3715 tf 4.8714` exactly.
 
 ## 5. Validation
+
+- **No oracle access in training.** A guarded maze raises on exact distances, transitions, layout, optimal
+  bins, or start-cell enumeration. Imagined generation and mixed MC/consistency training pass with that
+  guard; only separate diagnostics receive the real maze.
+- **Infeasible requests and failures are kept.** Requests can exceed the exact feasible bin. A fake world
+  model that never reaches the goal still supplies every requested training row. Diagnostics leave those
+  rows unchanged. Environment-backed buffers and the legacy oracle-child objective are refused.
+- The numerical smoke results below are historical, before oracle selection was removed.
 
 - **Prefix kept, dynamics correct.** The first `tau` steps are copied verbatim, and env-stepped continuations
   follow `maze.next_open`.
@@ -121,8 +141,8 @@ both show.
 | `BUFFER_SIZE` / `REFRESH_EVERY` | 512 / 500 | ~400 forward passes per refresh (one per action, one per next cell) |
 | `START_AFTER` | 2000 | |
 | `TAU_MAX` | 100 | see section 9 |
-| `REQUEST` | `"above"` | or `"best"` |
-| `DYNAMICS` | `"model"` | `"env"` = online upper bound |
+| `REQUEST` | `"above"` | or `"highest"`; neither uses feasibility information |
+| dynamics | learned NOR model | required for training; real maze only for evaluation |
 
 **Read section 3 of the notebook first.** Per refresh, from real prefixes, it shows how often the model:
 
@@ -132,8 +152,9 @@ both show.
 - produces far-start trajectories hitting their own best bin (the data has 0),
 - hallucinates, overall and among the rollouts that *improved*.
 
-Each rate is plotted against the exact random-walk rate from the same prefixes (from the DP), so it stays
-valid however training shifts the model. Asking for high reward selects for world-model errors that help, so
+Improvement and request-attainment rates are compared with exact random-walk rates from the same prefixes.
+These are imagined outcomes, not proof of improved real-maze behavior. High-reward requests can exploit
+world-model errors, so
 if hallucinations among improved rollouts run well above the overall rate, the loop is training on
 hallucinated shortcuts.
 
@@ -147,7 +168,7 @@ above.
 
 ## 7. Data accounting
 
-With the defaults, from step 2000 on:
+Historical accounting before oracle selection was removed, from step 2000 on:
 
 | | real | synthetic | ratio |
 |---|---|---|---|
@@ -176,7 +197,8 @@ Per-trajectory averaging also re-weights real rows against each other, so it cha
 
 ## 9. Known issue: few splices can produce the missing behaviour
 
-What the selection rule actually picks, measured without a model:
+Historical measurements for the removed oracle-feasibility selection rule, without a model. Remeasure these
+for the current rule; exact distances may evaluate the generated pool, but must not select it.
 
 | | kept splices | all training data |
 |---|---|---|
@@ -202,7 +224,8 @@ mid-trajectory prefixes, so less variety in the states the model continues from.
 3. Run the full 2x2. Check the notebook's section 3 first: is "improved" pulling away from the random-walk
    baseline, is the far-start own-best count nonzero, and do hallucinations among improved rollouts stay close
    to the overall rate?
-4. If it bootstraps, compare against `DYNAMICS="env"` to see what the world model's errors cost.
+4. Evaluate the learned policy in the real maze from fixed starts, including optimal-path attainment.
+   Compare real and imagined performance to measure world-model error. Never train on evaluation paths.
 
 Related, not part of this change: with the default uniform binning, almost all the conditioning signal sits
 in bins 10-11. Geometric binning (`Maze(binning="geometric")`, `colab/binning.ipynb`) spreads it over ~7 bins.

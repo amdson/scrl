@@ -61,6 +61,19 @@ def make_action_logits(model, tok: Tokenizer):
     return f
 
 
+def make_state_logits(model, tok: Tokenizer):
+    """jit'd (params, x, i) -> logits [B, 5] at state slot i: the 4 actions and END. Sampling from this instead
+    of the action slice lets the model end its own rollout (learned termination); no goal check is involved."""
+    types = jnp.asarray(tok.types)
+
+    @jax.jit
+    def f(params, x, i):
+        out = model.apply({"params": params}, x, types[: x.shape[1]])["next"]
+        return jnp.concatenate([out[:, i, tok.OUT_ACT0:tok.OUT_ACT0 + N_ACTIONS], out[:, i, tok.OUT_END:tok.OUT_END + 1]], -1)
+
+    return f
+
+
 def make_cell_logits(model, tok: Tokenizer):
     """jit'd (params, x, i) -> next-cell logits at slot i (an action slot): the model's own world model."""
     types = jnp.asarray(tok.types)
@@ -118,7 +131,7 @@ def _trajectory(tok: Tokenizer, maze, x, starts, length, reached):
 
 
 def continue_rollout(params, action_logits, tok: Tokenizer, maze, positions, actions, tau, mode_bins, rng,
-                     greedy=False, bucket=64, cell_logits=None):
+                     greedy=False, bucket=64, cell_logits=None, learned_end=False, max_steps=None):
     """Continue real trajectories from their prefixes h_tau.
 
     positions [N, T+1] / actions [N, T]: source trajectories in the dataset's layout. tau [N]: the switch time
@@ -128,33 +141,54 @@ def continue_rollout(params, action_logits, tok: Tokenizer, maze, positions, act
     cell_logits (make_cell_logits) makes the continuation IMAGINED: the next cell is sampled from the model's
     own dynamics head, read in NOR mode -- the unconditioned world model p(s' | h, a). Conditioning the
     dynamics on a requested high R would bias it toward lucky transitions (note section 7), and asking for high
-    R selects for exactly those. The real maze is then used only to count transitions it would not allow
-    (n_bad), never to produce the data. cell_logits=None steps the real maze instead: online interaction.
+    R selects for exactly those. No exact transitions or distances are accessed in imagined mode.
+    cell_logits=None steps the real maze for EVALUATION ONLY. Training callers must provide cell_logits.
 
-    Returns the same dict as rollout(), plus n_bad [N]."""
+    learned_end=True: `action_logits` must come from make_state_logits (actions + END); the model ends its own
+    rollout by emitting END and the goal cell is never consulted, so the result is legal as training input.
+    `reached` then means "the model emitted END". Requires cell_logits (imagined dynamics).
+    max_steps: stop each continuation after this many imagined steps (length = tau + max_steps if it has not
+    ended); the interval identity needs no terminal, so truncated rollouts are valid consistency rows and cost
+    max_steps model calls instead of up to T.
+
+    Returns the same dict as rollout(), plus the raw token buffer "x". Use rollout_diagnostics() afterwards to
+    evaluate imagined moves."""
     positions, actions = np.asarray(positions), np.asarray(actions)
+    if learned_end and cell_logits is None:
+        raise ValueError("learned_end requires cell_logits: termination and dynamics must both be the model's")
     tau, mode_bins = np.asarray(tau).astype(np.int64), np.asarray(mode_bins)
     N, T = len(tau), maze.T
     x = tok.with_mode(tok.encode_body(positions, actions, tau), np.maximum(mode_bins, 0))
     x[mode_bins < 0, 0] = tok.mode(None)
     pos = positions[np.arange(N), tau].astype(np.int64)
-    assert (pos != maze.goal).all(), "every source trajectory must still be running at its tau"
+    if not learned_end:
+        assert (pos != maze.goal).all(), "every source trajectory must still be running at its tau"
     length = np.full(N, T, dtype=np.int64)
+    if max_steps is not None:
+        length = np.minimum(length, tau + int(max_steps))
     alive = np.ones(N, dtype=bool)                   # rows before their tau are alive but not yet acting
-    bad = np.zeros(N, dtype=np.int64)
-    for t in range(int(tau.min()), T):
-        act = alive & (t >= tau)
+    for t in range(int(tau.min()), int(length.max())):
+        act = alive & (t >= tau) & (t < length)
         if not act.any():
             continue
         si = int(tok.sidx[t])
         Lb = min(tok.L, (si // bucket + 1) * bucket)
         lg = np.asarray(action_logits(params, jnp.asarray(x[:, :Lb]), si))
         p = np.exp(_log_softmax(lg))
-        a = p.argmax(-1) if greedy else np.minimum((rng.random(N)[:, None] > p.cumsum(-1)).sum(-1), N_ACTIONS - 1)
+        a = p.argmax(-1) if greedy else np.minimum((rng.random(N)[:, None] > p.cumsum(-1)).sum(-1), p.shape[-1] - 1)
+        if learned_end:                              # column N_ACTIONS is END: the model ends its own rollout
+            ended = act & (a == N_ACTIONS)
+            length[ended] = t
+            alive &= ~ended
+            act &= ~ended
+            a = np.minimum(a, N_ACTIONS - 1)
+            if not act.any():
+                if not alive.any():
+                    break
+                continue
         x[act, si + 1] = tok.act(a[act])
-        true_next = maze.next_open[pos, a]
         if cell_logits is None:
-            nxt = true_next
+            nxt = maze.next_open[pos, a]
         else:
             Lc = min(tok.L, ((si + 1) // bucket + 1) * bucket)
             xn = x[:, :Lc].copy()
@@ -162,17 +196,59 @@ def continue_rollout(params, action_logits, tok: Tokenizer, maze, positions, act
             pc = np.exp(_log_softmax(np.asarray(cell_logits(params, jnp.asarray(xn), si + 1)).astype(np.float64)))
             nxt = pc.argmax(-1) if greedy else np.minimum((rng.random(N)[:, None] > pc.cumsum(-1)).sum(-1),
                                                           maze.n_cells - 1)
-            bad += act & (nxt != true_next)          # diagnostic only -- the data never sees true_next
         pos = np.where(act, nxt, pos)
         x[act, si + 2] = tok.pos(pos[act])
-        arrived = act & (pos == maze.goal)
-        length[arrived] = t + 1
-        alive &= ~arrived
+        if not learned_end:
+            arrived = act & (pos == maze.goal)
+            length[arrived] = t + 1
+            alive &= ~arrived
         if not alive.any():
             break
     out = _trajectory(tok, maze, x, positions[:, 0], length, ~alive)
-    out["n_bad"] = bad
+    out["x"] = x
     return out
+
+
+def rollout_diagnostics(maze, b, gt=None):
+    """Evaluate already-generated splices using the real maze. Never mutates or filters training rows.
+
+    Exact transitions, optimal distances, and DP baselines belong here, outside generation. Imagined
+    rewards and these diagnostics do not replace evaluating the policy by acting in the real maze.
+    """
+    from .testset import FAR
+
+    pos, actions = b["positions"].astype(np.int64), b["actions"].astype(np.int64)
+    t = np.arange(maze.T)[None]
+    tau = b["tau"]
+    active = (t >= tau[:, None]) & (t < b["length"][:, None])
+    n_bad = ((pos[:, 1:] != maze.next_open[pos[:, :-1], actions]) & active).sum(-1)
+    s0 = pos[:, 0]
+    far_best = (maze.dist[s0] >= FAR) & (b["achieved"] == maze.best_bin(s0))
+    gt = compute_ground_truth(maze) if gt is None else gt
+    h = gt.h[tau, pos[np.arange(len(tau)), tau]]
+    k = np.arange(maze.K)[None]
+    return dict(n_bad=n_bad, far_own_best=int(far_best.sum()),
+                p_improve_rw=(h * (k > b["orig_bin"][:, None])).sum(-1),
+                p_request_rw=(h * (k >= b["requested"][:, None])).sum(-1))
+
+
+def imagined_rollout_eval(maze, ro, tau):
+    """EVALUATION ONLY. Check a batch of imagined rollouts (continue_rollout output, dataset layout) against the
+    real maze: the fraction of imagined steps whose next cell is not the real transition, the fraction of
+    rollouts with at least one such move, and where the model's END emissions landed. Never feeds training."""
+    pos, actions = ro["positions"].astype(np.int64), ro["actions"].astype(np.int64)
+    tau, length = np.asarray(tau).astype(np.int64), ro["length"].astype(np.int64)
+    t = np.arange(maze.T)[None]
+    active = (t >= tau[:, None]) & (t < length[:, None])
+    bad = (pos[:, 1:] != maze.next_open[pos[:, :-1], actions]) & active
+    n_steps = max(int(active.sum()), 1)
+    ended = ro["reached"].astype(bool)
+    at_goal = pos[np.arange(len(length)), length] == maze.goal
+    return dict(invalid_step_frac=float(bad.sum() / n_steps),
+                invalid_row_frac=float((bad.sum(1) > 0).mean()),
+                end_at_goal=float(at_goal[ended].mean()) if ended.any() else np.nan,   # END emitted at the goal
+                reached_goal=float((at_goal & ended).mean()),                          # ended, and really there
+                mean_imagined_steps=float(active.sum(1).mean()))
 
 
 def return_sweep(params, model, tok: Tokenizer, maze, n_per=64, seed=0, greedy=False):
@@ -381,7 +457,8 @@ def make_enrichment_eval(tok: Tokenizer, maze, d, n=128, seed=0, chunk=64):
     come from the identical prefix, so the difference is conditioning alone: no feasibility or composition
     artefact. Prefixes from which the goal is already unreachable are dropped.
 
-    Returns {"enrich/points", "enrich/frac_of_exact", "goalward/fail", "goalward/best"}. The "/" split keeps
+    Returns {"enrich/points", "enrich/frac_of_exact", "goalward/fail", "goalward/best"} plus
+    "goalward_bin/<k>": the goalward mass when asking each bin k, on the same prefixes. The "/" split keeps
     them plottable by the notebooks' plot_curves(metrics=("enrich",), settings=("points", ...)).
 
     The exact conditional's enrichment is computed once as the ceiling -- on the canonical maze it is about
@@ -416,9 +493,14 @@ def make_enrichment_eval(tok: Tokenizer, maze, d, n=128, seed=0, chunk=64):
             lg = np.concatenate([np.asarray(fwd(params, jnp.asarray(x_all[k, i:i + chunk]))["pi_logits"][:, :T])
                                  for i in range(0, n, chunk)]).astype(np.float64)
             q.append(np.exp(_log_softmax(lg)))
-        fail, best, delta = score_q(np.stack(q))
-        return {"enrich/points": delta, "enrich/frac_of_exact": delta / ceiling if ceiling else np.nan,
-                "goalward/fail": fail, "goalward/best": best}
+        q = np.stack(q)
+        fail, best, delta = score_q(q)
+        out = {"enrich/points": delta, "enrich/frac_of_exact": delta / ceiling if ceiling else np.nan,
+               "goalward/fail": fail, "goalward/best": best}
+        g = (q * closer[None]).sum(-1)                 # [K, n, T] goalward mass when asking each bin
+        for k in range(K):                             # same prefixes for every bin, so these are paired too
+            out[f"goalward_bin/{k:02d}"] = 100 * g[k][use].mean()
+        return out
 
     fn.ceiling = ceiling
     return fn

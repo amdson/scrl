@@ -249,6 +249,176 @@ def rollout_batch(tok, maze, d, idx):
                 lengths=d["length"][idx].astype(np.int32))
 
 
+def make_tilted_sampler(model, tok, maze, d, n_train, beta, floor=0.0, truncate=False):
+    """A cons_sampler for train(): recorded rows with a QUERY bin drawn from the model's own reward head.
+
+    The interval identity holds for every reward, not only the one a row achieved, so the bin in the
+    conditioned pass is a query. Here it is sampled per row from the NOR reward prediction at the start
+    prefix, tilted upward (math.tex section 2):
+
+        rho(k) ~ q_0(k) * exp(beta(step) * r_k),      r_k = maze.bin_reward (label definitions only)
+
+    q_0 depends only on [MODE, pos_0], so it costs a forward pass over two slots. `floor` zeroes bins the
+    model puts below that probability before tilting, so a large beta cannot promote softmax dust; with
+    truncate=True it also cuts each row's intervals where the model's belief in the query bin falls below the
+    floor (make_belief_truncation). Uses no maze structure: the reward head is the only feasibility estimate. sampler.history records the
+    empirical query-bin histogram per call for diagnostics."""
+    types2 = jnp.asarray(tok.types[:2])
+    r_k = np.asarray(maze.bin_reward, dtype=np.float64)
+    trunc = make_belief_truncation(model, tok, floor) if (truncate and floor > 0) else None
+
+    @jax.jit
+    def q0_logits(params, x2):
+        return model.apply({"params": params}, x2, types2)["value"][:, 1]           # slot after pos_0
+
+    def sampler(params, rng, n, step):
+        idx = rng.integers(0, n_train, n)
+        body = tok.encode_body(d["positions"][idx], d["actions"][idx], d["length"][idx])
+        x_nor = tok.with_mode(body, None)
+        logq = _log_softmax_np(np.asarray(q0_logits(params, jnp.asarray(x_nor[:, :2]))).astype(np.float64))
+        b = beta(step) if callable(beta) else float(beta)
+        logits = logq + b * r_k[None]
+        if floor > 0:
+            logits = np.where(logq < np.log(floor), -np.inf, logits)
+        p = np.exp(logits - logits.max(-1, keepdims=True)); p /= p.sum(-1, keepdims=True)
+        R_bin = np.minimum((rng.random(n)[:, None] > p.cumsum(-1)).sum(-1), maze.K - 1).astype(np.int32)
+        lengths, n_cut = d["length"][idx].astype(np.int32), 0
+        if trunc is not None:
+            lengths, n_cut = trunc(params, x_nor, R_bin, lengths)
+        sampler.history.append(dict(step=int(step), beta=b, bins=np.bincount(R_bin, minlength=maze.K),
+                                    n_cut=n_cut, mean_used=float(lengths.mean())))
+        targets, _ = tok.next_targets(x_nor)
+        return dict(x_nor=x_nor, x_R=tok.with_mode(body, R_bin), targets=targets, R_bin=R_bin, lengths=lengths)
+
+    sampler.history = []
+    return sampler
+
+
+def make_belief_truncation(model, tok, floor):
+    """(params, x_nor, R_bin, lengths) -> lengths cut at the first prefix where the model's OWN NOR reward
+    prediction for the query bin drops below `floor`. Intervals past that point compare softmax floors, which
+    is where a counterfactual query stops meaning anything; the model's belief is the only feasibility
+    estimate allowed. Returns (lengths, n_cut)."""
+    from .model import make_forward
+    fwd = make_forward(model, tok)
+
+    def truncate(params, x_nor, R_bin, lengths):
+        logq = np.asarray(fwd(params, jnp.asarray(x_nor))["v_logits"]).astype(np.float64)   # [B, T+1, K]
+        logq = _log_softmax_np(logq)
+        bq = np.take_along_axis(logq, np.asarray(R_bin)[:, None, None], -1)[..., 0]            # [B, T+1]
+        below = bq < np.log(floor)
+        first = np.where(below.any(1), below.argmax(1), lengths + 1)                         # prefix index
+        new = np.minimum(lengths, np.maximum(first - 1, 1)).astype(np.int32)                  # >= 1 step
+        return new, int((new < lengths).sum())
+
+    return truncate
+
+
+def make_rollout_sampler(model, tok, maze, d, n_train, request="highest", beta=0.0, buffer_n=128,
+                         refresh_every=250, tau_max=0, floor=0.0, max_steps=None):
+    """A cons_sampler whose rows are the model's own reward-conditioned rollouts, used ONLY as places to
+    enforce the identity (math.tex section 3). Nothing is relabelled and nothing is fitted.
+
+    From a recorded prefix h_tau (tau ~ U{0..tau_max}), actions come from the conditioned policy under the
+    request, next cells from the NOR dynamics head, and the rollout ends when the model emits END. The
+    query bin for the residual is the request itself. request="highest" asks for K-1; request="tilt" draws
+    it from the model's reward prediction at the start prefix tilted by exp(beta r_k), as make_tilted_sampler.
+    With floor > 0 each row's intervals stop where the model's belief in the query bin falls below the floor.
+    max_steps truncates every rollout after that many imagined steps: the identity needs no terminal, short
+    rollouts stay inside the query's plausible window, and generation costs max_steps calls instead of up to T.
+    Because the floor cuts a row at its first below-floor prefix, put the imagined steps first (tau_max=0).
+    No maze structure is used anywhere. sampler.history records per-refresh readouts."""
+    from .evaluate import make_state_logits, make_cell_logits, continue_rollout
+    if request not in ("highest", "tilt"):
+        raise ValueError("request must be 'highest' or 'tilt'")
+    state_logits, cell_logits = make_state_logits(model, tok), make_cell_logits(model, tok)
+    types2 = jnp.asarray(tok.types[:2])
+    r_k = np.asarray(maze.bin_reward, dtype=np.float64)
+    truncate = make_belief_truncation(model, tok, floor) if floor > 0 else None
+
+    @jax.jit
+    def q0_logits(params, x2):
+        return model.apply({"params": params}, x2, types2)["value"][:, 1]
+
+    state = {"buf": None, "last": -10**9}
+
+    def refresh(params, rng, step):
+        idx = rng.integers(0, n_train, buffer_n)
+        L = d["length"][idx].astype(np.int64)
+        tau = np.minimum(rng.integers(0, tau_max + 1, buffer_n), L - 1)
+        if request == "highest":
+            req = np.full(buffer_n, maze.K - 1, np.int32)
+        else:
+            body = tok.encode_body(d["positions"][idx], d["actions"][idx], L)
+            logq = _log_softmax_np(np.asarray(q0_logits(params, jnp.asarray(tok.with_mode(body, None)[:, :2]))).astype(np.float64))
+            b = beta(step) if callable(beta) else float(beta)
+            logits = logq + b * r_k[None]
+            if floor > 0:
+                logits = np.where(logq < np.log(floor), -np.inf, logits)
+            p = np.exp(logits - logits.max(-1, keepdims=True)); p /= p.sum(-1, keepdims=True)
+            req = np.minimum((rng.random(buffer_n)[:, None] > p.cumsum(-1)).sum(-1), maze.K - 1).astype(np.int32)
+        ro = continue_rollout(params, state_logits, tok, maze, d["positions"][idx], d["actions"][idx], tau, req, rng,
+                              cell_logits=cell_logits, learned_end=True, max_steps=max_steps)
+        x = ro["x"]
+        x_nor = tok.with_mode(x, None)
+        lengths = ro["length"].astype(np.int32)
+        n_cut = 0
+        if truncate is not None:
+            lengths, n_cut = truncate(params, x_nor, req, lengths)
+        targets, _ = tok.next_targets(x_nor)
+        state["buf"] = dict(x_nor=x_nor, x_R=tok.with_mode(x, req), targets=targets, R_bin=req.astype(np.int32),
+                            lengths=lengths)
+        state["ro"], state["tau"], state["ro_step"] = ro, tau, int(step)   # for evaluate.imagined_rollout_eval only
+        sampler.history.append(dict(step=int(step), ended=float(ro["reached"].mean()),
+                                    mean_len=float(ro["length"].mean()), mean_used=float(lengths.mean()),
+                                    n_cut=n_cut, bins=np.bincount(req, minlength=maze.K)))
+
+    def sampler(params, rng, n, step):
+        if step - state["last"] >= refresh_every:
+            refresh(params, rng, step)
+            state["last"] = step
+        i = rng.integers(0, buffer_n, n)
+        return {k: v[i] for k, v in state["buf"].items()}
+
+    sampler.history = []
+    sampler.last_rollout = lambda: (state["ro"], state["tau"], state["ro_step"])
+    return sampler
+
+
+def concat_batches(batches):
+    """Concatenate consistency batches (same token length) along the row axis."""
+    return {k: np.concatenate([b[k] for b in batches]) for k in batches[0]}
+
+
+def make_phased_sampler(tok, maze, d, n_train, late, start, fracs=None, keep_recorded=0.5):
+    """cons_sampler that uses recorded rows with their recorded bin (the default) until `start`. After that a
+    `keep_recorded` share of each batch stays recorded-bin real rows and the rest is drawn from the samplers in
+    `late` (a list), split by `fracs` (default equal). The recorded-bin term is kept because it is the one that
+    improves the far-start value tail; the proposals are added to it, not swapped in for it."""
+    late = list(late)
+    fracs = np.full(len(late), 1.0 / len(late)) if fracs is None else np.asarray(fracs, dtype=float) / np.sum(fracs)
+
+    def recorded(params, rng, n, step):
+        return rollout_batch(tok, maze, d, rng.integers(0, n_train, n))
+
+    def sampler(params, rng, n, step):
+        if step < start:
+            return dict(recorded(params, rng, n, step), n_rec=np.int32(n))
+        n_rec = int(round(keep_recorded * n))
+        counts = np.diff(np.round(np.cumsum(np.concatenate([[0.0], fracs])) * (n - n_rec)).astype(int))
+        parts = [s(params, rng, int(c), step) for s, c in zip(late, counts) if c > 0]
+        if n_rec:
+            parts.insert(0, recorded(params, rng, n_rec, step))
+        return dict(concat_batches(parts), n_rec=np.int32(n_rec))   # recorded rows come first
+
+    return sampler
+
+
+def _log_softmax_np(z):
+    z = z - z.max(-1, keepdims=True)
+    return z - np.log(np.exp(z).sum(-1, keepdims=True))
+
+
 def data_nll(lp, mask):
     """Teacher-forced next-token loss from gathered log probs, matching model.next_token_loss."""
     m = mask.astype(lp.dtype)

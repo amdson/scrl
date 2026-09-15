@@ -4,10 +4,10 @@
   python run.py truth        # exact random-walk ground truth figure -> data/canonical/truth.png
   python run.py show [i]     # rollout i (default: the shortest) drawn on the maze and as tokens
   python run.py testset      # exact test set from the DP -> data/canonical/testset.npz
-  python run.py train [name] [steps] [consistency]   # half NOR half R mode; optional TD + A losses
+  python run.py train [name] [steps] [consistency]   # half NOR half R mode; optional MC + interval consistency
   python run.py eval [name]            # accuracy by MODE setting and in-maze return by requested bin
   python run.py value-eval [name]      # value head's E[R] vs the exact E[R] on every test-set prefix
-  python run.py sweep [steps]          # train base / mc / td / mc_a4 / td_a4 with exact-test tracking -> runs/sweep/
+  python run.py sweep [steps]          # train base / mc / td / interval consistency with exact-test tracking
   python run.py sweep-plot             # test-metric curves for the sweep -> runs/sweep/curves.png
   python run.py cons-sweep [steps]     # mc baseline vs every interval consistency loss -> runs/cons/
   python run.py cons-plot              # test curves + consistency diagnostics -> runs/cons/

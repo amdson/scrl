@@ -10,10 +10,7 @@ bin) and always trains the teacher-forced next-token loss. LossConfig adds value
                            and its baseline see an identical data objective and differ only by this term.
                            cons_loss picks the objective from consistency.ALL.       (main step)
 
-  a    identity (A):       CE( pi_R(. | h_t, k) , sg[ pi(a | h_t) V_{t+1}(k | h_t, a) / sum_a' ... ] ) for one
-                           random step t and bin k per rollout, children from the maze table. Runs as its own
-                           a_updates gradient steps per training step, each on a_batch fresh rollouts, with a
-                           separate Adam at lr_a; on after a_warmup of training; skipped where the denominator ~0.
+  a    legacy oracle-child objective: refused (used real-maze transitions during training).
 
 train() optionally calls eval_fn(params, fwd) every eval_every steps; the results go into history.json.
 """
@@ -45,7 +42,7 @@ sg = jax.lax.stop_gradient
 class LossConfig:
     mc: bool = False
     td: bool = False
-    a: bool = False
+    a: bool = False          # legacy flag retained for loading old runs; train() refuses it
     w_mc: float = 1.0
     w_td: float = 1.0
     a_updates: int = 4        # separate A gradient steps per training step
@@ -100,30 +97,6 @@ def value_batch(maze, d, idx):
 def cons_batch(tok: Tokenizer, maze, d, idx):
     """Host-side inputs for the consistency term: the same rollouts tokenized in both modes."""
     return C.rollout_batch(tok, maze, d, idx)
-
-
-def a_batch(tok: Tokenizer, maze, d, idx, rng):
-    """Host-side inputs for one A step: NOR prefixes, the same prefixes with MODE = a random bin k, and the four
-    children of one random state per rollout (terminal children are labelled analytically)."""
-    n, T = len(idx), maze.T
-    L = d["length"][idx].astype(np.int64)
-    x_nor = tok.with_mode(tok.encode_body(d["positions"][idx], d["actions"][idx], L), None)
-    t = (rng.random(n) * L).astype(np.int64)                       # one state per row, t < L
-    k = rng.integers(0, maze.K, n)                                  # one outcome bin per row
-    x_k = x_nor.copy()
-    x_k[:, 0] = tok.mode(k)
-    s = d["positions"][idx, t].astype(np.int64)
-    si = tok.sidx[t]
-    children = np.repeat(x_nor[:, None], N_ACTIONS, 1)              # [n, 4, L, 3]; causal, so later slots don't matter
-    nxt = maze.next_open[s]                                         # [n, 4]
-    for a in range(N_ACTIONS):
-        children[np.arange(n), a, si + 1] = tok.act(np.full(n, a))
-        children[np.arange(n), a, si + 2] = tok.pos(nxt[:, a])
-    goal = nxt == maze.goal
-    return dict(x_nor=x_nor, x_k=x_k, t=t.astype(np.int32), k=k.astype(np.int32),
-                children=children.reshape(n * N_ACTIONS, tok.L, 3),
-                child_term=goal | ((t + 1) == T)[:, None],
-                child_term_bin=np.where(goal, maze.success_bin(t + 1)[:, None], maze.FAIL_BIN).astype(np.int32))
 
 
 def make_step(model, tok: Tokenizer, opt, lc: LossConfig):
@@ -189,41 +162,62 @@ def make_step(model, tok: Tokenizer, opt, lc: LossConfig):
     return step
 
 
-def make_a_step(model, tok: Tokenizer, opt_a):
-    """One A step: pi_R(. | h_t, k) toward the normalized posterior pi(a | h_t) V_{t+1}(k | child a)."""
+def make_grad_norms(model, tok: Tokenizer, lc: LossConfig):
+    """jit'd (params, x, tgt, mask, cb, nb) -> global gradient norm of each loss term taken ALONE (unweighted),
+    plus the consistency term split into the recorded-bin rows (the first nb["n_rec"] rows, all rows when the
+    key is absent) and the proposal rows, with the per-row consistency loss mean and std of each half. A
+    diagnostic for the relative pull of the terms and for the variance of model-proposed queries; it runs
+    every train(grad_every=...) steps and never touches the update."""
     types, sidx = jnp.asarray(tok.types), jnp.asarray(tok.sidx)
-    K = tok.K
+    T, K = tok.T, tok.K
+    terms = C.make_terms_fn(model, tok, jit=False) if lc.cons else None
+    gnorm = lambda g: optax.global_norm(g)
 
-    def loss_fn(p, ab):
-        apply = lambda z: model.apply({"params": p}, z, types)
-        n = ab["t"].shape[0]
-        st = sidx[ab["t"]]
-        pi_t = sg(jax.nn.softmax(apply(ab["x_nor"])["next"][jnp.arange(n), st, :N_ACTIONS], -1))   # [n, 4]
-        logpiR = jax.nn.log_softmax(apply(ab["x_k"])["next"][jnp.arange(n), st, :N_ACTIONS], -1)
-        vc = apply(ab["children"])["value"][jnp.arange(n * N_ACTIONS), jnp.repeat(st, N_ACTIONS) + 2]
-        vc = sg(jax.nn.softmax(vc, -1)).reshape(n, N_ACTIONS, K)
-        vc = jnp.where(ab["child_term"][..., None], jax.nn.one_hot(ab["child_term_bin"], K), vc)
-        num = pi_t * (vc * jax.nn.one_hot(ab["k"], K)[:, None, :]).sum(-1)
-        Z = num.sum(-1)
-        ok = Z > 1e-8
-        la = -((num / jnp.maximum(Z, 1e-30)[:, None]) * logpiR).sum(-1)
-        la = (la * ok).sum() / jnp.maximum(ok.sum(), 1)
-        return la, dict(a=la, a_frac=ok.mean())
+    def tf_loss(p, x, tgt, mask):
+        return next_token_loss(model.apply({"params": p}, x, types)["next"], tgt, mask)
+
+    def mc_loss(p, x, cb):
+        n = cb["L"].shape[0]
+        logV = jax.nn.log_softmax(model.apply({"params": p}, x[:n], types)["value"][:, sidx], -1)
+        valid_s = jnp.arange(T + 1)[None] <= cb["L"][:, None]
+        mc = -(jax.nn.one_hot(cb["term_bin"], K)[:, None] * logV).sum(-1)
+        return (mc * valid_s).sum() / valid_s.sum()
+
+    def cons_rows(p, nb):
+        t = terms(p, nb["x_nor"], nb["x_R"], nb["targets"], nb["R_bin"])
+        return C.ALL[lc.cons_loss](C.residuals(t["u"], t["v"], t["b"], nb["lengths"]))     # per row
+
+    def cons_masked(p, nb, w):
+        return (cons_rows(p, nb) * w).sum() / jnp.maximum(w.sum(), 1.0)
 
     @jax.jit
-    def a_step(params, opt_state, ab):
-        (loss, parts), g = jax.value_and_grad(loss_fn, has_aux=True)(params, ab)
-        u, opt_state = opt_a.update(g, opt_state, params)
-        return optax.apply_updates(params, u), opt_state, parts
+    def f(params, x, tgt, mask, cb, nb):
+        out = {"gnorm/tf": gnorm(jax.grad(tf_loss)(params, x, tgt, mask))}
+        if lc.mc:
+            out["gnorm/mc"] = gnorm(jax.grad(mc_loss)(params, x, cb))
+        if lc.cons:
+            B = nb["x_nor"].shape[0]
+            n_rec = nb["n_rec"] if "n_rec" in nb else B
+            rec = (jnp.arange(B) < n_rec).astype(jnp.float32)
+            rows = cons_rows(params, nb)
+            out["gnorm/cons"] = gnorm(jax.grad(cons_masked)(params, nb, jnp.ones(B, jnp.float32)))
+            out["gnorm/cons_recorded"] = gnorm(jax.grad(cons_masked)(params, nb, rec))
+            out["gnorm/cons_proposal"] = gnorm(jax.grad(cons_masked)(params, nb, 1.0 - rec))
+            for name, w in (("recorded", rec), ("proposal", 1.0 - rec)):
+                m = (rows * w).sum() / jnp.maximum(w.sum(), 1.0)
+                sd = jnp.sqrt((((rows - m) ** 2) * w).sum() / jnp.maximum(w.sum(), 1.0))
+                out[f"cons_rows/{name}_mean"], out[f"cons_rows/{name}_std"] = m, sd
+                out[f"cons_rows/{name}_n"] = w.sum()
+        return out
 
-    return a_step
+    return f
 
 
 def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_heads=4, seed=0,
           loss: LossConfig | None = None, consistency=False, a_warmup=None,
           eval_fn=None, eval_every=0, log_every=100, log=print, cons_sampler=None, maze_kw=None,
-          mixer=None, mix_frac=0.0):
-    """loss: a LossConfig (default: next-token only). consistency=True is shorthand for LossConfig(td=True, a=True).
+          mixer=None, mix_frac=0.0, init_params=None, metrics_fn=None, grad_every=0):
+    """loss: a LossConfig (default: next-token only). consistency=True is shorthand for LossConfig(mc=True, cons=True).
     eval_fn(params, fwd) -> dict of metrics, called at step 0, every eval_every steps, and at the end.
 
     mixer / mix_frac: an object with maybe_refresh(params, step), ready and rows(rng, n) -- see
@@ -237,34 +231,45 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
     cons_sampler(params, rng, n, step) -> a batch dict like consistency.rollout_batch, overriding where the
     consistency term's rollouts come from. The interval identity constrains the model's own conditionals and
     needs no labels, so it is valid on ANY trajectory distribution -- which is the point of passing model
-    rollouts here rather than the random-walk training set. Default: uniform from the training set."""
-    lc = loss or (LossConfig(td=True, a=True) if consistency else LossConfig())
+    rollouts here rather than the random-walk training set. Default: uniform from the training set.
+
+    init_params: start from these parameters (e.g. load_run(name)[0]) instead of a fresh init; the optimizer
+    state is fresh either way.
+
+    metrics_fn(step, metrics, kind): optional sink for a logger such as wandb. kind="train" gets the averaged
+    loss parts at every log_every steps; kind="test" gets the eval_fn dict at every checkpoint."""
+    lc = loss or (LossConfig(mc=True, cons=True) if consistency else LossConfig())
     if a_warmup is not None:
         lc = replace(lc, a_warmup=a_warmup)
+    if lc.a:
+        raise ValueError("the legacy a objective uses real-maze child transitions and is disabled; "
+                         "use mc with interval consistency (cons=True) for offline training")
     if mixer is not None and lc.td:
         raise ValueError("td's importance weight assumes the uniform behaviour policy, which model-generated "
-                         "rows do not follow -- use mc (or a) with a mixer")
+                         "rows do not follow -- use mc with a mixer")
     maze, d = load(**(maze_kw or {}))      # maze_kw={"binning": ..., "n_bins": ...} relabels outcomes only
     tok = Tokenizer(maze)
     n_train = len(d["length"]) - N_HELDOUT
     cfg = ModelConfig.for_tokenizer(tok, d_model=d_model, n_layers=n_layers, n_heads=n_heads)
     model = MazeTransformer(cfg)
     params = model.init(jax.random.PRNGKey(seed), jnp.asarray(tok.blank(1)), jnp.asarray(tok.types))["params"]
+    if init_params is not None:
+        params = jax.tree_util.tree_map(jnp.asarray, init_params)
     opt = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(lr))
     opt_state = opt.init(params)
     step = make_step(model, tok, opt, lc)
-    if lc.a:
-        opt_a = optax.chain(optax.clip_by_global_norm(1.0), optax.adam(lc.lr_a))
-        a_opt_state = opt_a.init(params)
-        a_step = make_a_step(model, tok, opt_a)
+    grad_norms = make_grad_norms(model, tok, lc) if grad_every else None
     fwd = make_forward(model, tok) if eval_fn else None
-    log(f"[{name}] {maze} params={count_params(params):,} train={n_train:,} held-out={N_HELDOUT} loss={lc}")
+    log(f"[{name}] maze={maze.H}x{maze.W} T={maze.T} K={maze.K} params={count_params(params):,} "
+        f"train={n_train:,} held-out={N_HELDOUT} loss={lc}")
     rng = np.random.default_rng(seed)
     hist, tests, recent, t0 = [], [], {}, time.time()
 
     def run_eval(i):
         m = dict(step=i, **eval_fn(params, fwd))
         tests.append(m)
+        if metrics_fn:
+            metrics_fn(i, m, "test")
         log(f"  test@{i}: " + " ".join(f"{k} {v:.4f}" for k, v in m.items() if k != "step" and np.isscalar(v)))
 
     if eval_fn:
@@ -293,19 +298,18 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
         else:
             nb = cons_batch(tok, maze, d, rng.integers(0, n_train, lc.cons_batch))
         cons_on = float(lc.cons and i > lc.cons_warmup * steps)
+        if grad_norms is not None and i % grad_every == 0:
+            for k, v in grad_norms(params, jnp.asarray(x), jnp.asarray(tgt), jnp.asarray(mask), to_jnp(cb), to_jnp(nb)).items():
+                recent.setdefault(k, []).append(float(v))
         params, opt_state, parts = step(params, opt_state, jnp.asarray(x), jnp.asarray(tgt), jnp.asarray(mask),
                                         to_jnp(cb), to_jnp(nb), jnp.float32(cons_on))
         for k, v in parts.items():
             recent.setdefault(k, []).append(float(v))
-        if lc.a and i > lc.a_warmup * steps:
-            for _ in range(lc.a_updates):
-                ab = a_batch(tok, maze, d, rng.integers(0, n_train, lc.a_batch), rng)
-                params, a_opt_state, ap = a_step(params, a_opt_state, to_jnp(ab))
-                for k, v in ap.items():
-                    recent.setdefault(k, []).append(float(v))
         if i % log_every == 0 or i == steps:
             hist.append(dict(step=i, **{k: float(np.mean(v)) for k, v in recent.items()}))
             recent = {}
+            if metrics_fn:
+                metrics_fn(i, hist[-1], "train")
             log(f"  step {i}: " + " ".join(f"{k} {v:.4f}" for k, v in hist[-1].items() if k != "step")
                 + f" ({(time.time() - t0) / i * 1000:.0f} ms/step)")
         if eval_fn and eval_every and (i % eval_every == 0 or i == steps):

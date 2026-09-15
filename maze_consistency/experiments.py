@@ -24,8 +24,6 @@ CONFIGS = {
     "base": LossConfig(),                    # next-token loss only (NOR + R teacher forcing)
     "mc":   LossConfig(mc=True),             # + Monte Carlo value
     "td":   LossConfig(td=True),             # + TD value, identity (B)
-    "mc_a4": LossConfig(mc=True, a=True),    # + Monte Carlo value + identity (A)
-    "td_a4": LossConfig(td=True, a=True),    # + TD value + identity (A): the full method
 }
 # Interval consistency (consistency_losses.md). Every variant is "mc" plus one consistency objective, so the
 # data objective is identical across the whole comparison and the only difference is the added term.
@@ -52,9 +50,8 @@ def cons_lambda_configs(loss="all_scaled", factors=(0.1, 1.0, 10.0)):
     return {f"mc_{loss}_x{f:g}": LossConfig(mc=True, cons=True, cons_loss=loss, w_cons=base * f) for f in factors}
 
 
-# "a4": A runs as its own steps, LossConfig.a_updates = 4 per training step on a_batch = 16 fresh rollouts each,
-# with a separate Adam at lr_a = 1e-4 (main loss: 1e-3). Earlier sweeps named mc_a / td_a put A inside the main
-# loss with 16 examples per step; their runs stay on disk and load_sweep still plots them.
+# Legacy mc_a4 / td_a4 used real-maze child transitions and are no longer training configurations.
+# Their saved runs can still be loaded and plotted.
 
 
 @dataclass(frozen=True)

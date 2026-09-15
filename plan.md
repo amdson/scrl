@@ -22,17 +22,7 @@ Consistency identities (fixed token order, R floats):
 
 **Dynamics.** Actions {U, D, L, R}. Deterministic; moving into a wall = stay. Horizon T = 60 (≈ 2–3 d*). Episode ends at goal or T.
 
-**Reward.** -1 per step. Episode return R in [-T, -d*]; not-reached episodes get R = -T - 1 (own bin). Discretize R to K = T + 2 categorical bins directly (one bin per integer). No coarser binning: it costs nothing here and keeps (B) exact.
-
-**Locked-door variant (for H3).** Same maze plus a one-cell door on a shortcut. At episode start the door is locked with p = 0.7; locked/unlocked is revealed only in the pos token on arrival (add a 5th grid value DOOR_LOCKED visible in the pos-embedding, not in the prompt). Route via door: 10 steps if open, else 30 (dead-end detour). Route around: 12. Choose the layout so these are the only two sensible routes.
-
-**Ground truth (numpy, once).**
-- `h[t, s, r]` = P_randomwalk(return-to-go = r | state s at time t), by backward induction over t. This is `V*_t`.
-- `pi_R*[t, s, r, a] = pi(a) * h[t+1, s', r+1] / h[t, s, r]`, the Doob h-transform. At r = -d* from the start state this is uniform over shortest paths.
-- `Q*[t, s, a] = E[R | s, a]` under random walk, for the expected-value tilt reference.
-- For the door variant, the state includes the door flag once observed; do DP over (pos, door_flag ∈ {unknown, open, locked}).
-
----
+**Reward.** 1 at goal, with exponential temporal discounting 
 
 ## 2. Data
 
@@ -42,9 +32,6 @@ Random-walk episodes only. `pi_data(a|s) = 1/4`.
 - Store `actions int8[N,T]`, `positions int16[N,T]` (flattened cell index), `returns int16[N]`, `length int16[N]`.
 - Tokenization per episode: `[MODE] [grid 121 tokens] [(a_1,pos_1) ... (a_L,pos_L)] [EOS]`. Action and position are separate tokens (so sequence length ≈ 1 + 121 + 2T + 1 = 243; fine).
 - MODE token is `R_k` (one of K) or `NOR`. Each data episode appears in both modes.
-
-No model rollouts are needed for the acyclic configuration: `q` (the prefix distribution for the consistency losses) is the random walk itself, which is the environment, not the model. Generate extra random-walk prefixes cheaply in numpy. Model rollouts only enter in E4/E5 loop closures.
-
 ---
 
 ## 3. Model (flax.linen, single module)

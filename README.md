@@ -71,18 +71,22 @@ DP, where every loss is 0, so the sweep's held-out `cons/` curves are absolute.
 feeds the spliced trajectories back into training. It targets the coverage gap directly: of 66,609 far-start
 random walks, none achieved their start's best outcome, so there was nothing to imitate.
 
+- Requests use configured bins only: `above` samples above the recorded outcome; `highest` asks for K-1
+  regardless of feasibility. No optimal distances or near-optimal path selection choose training examples.
+  All generated outcomes, including failures, are kept.
 - Continuations are imagined: actions from the R-conditioned policy, next cells from the model's own dynamics
   head in NOR mode (the unconditioned world model). No environment interaction produces the data. The real
-  maze only counts imagined moves it would not allow -- reported among the rollouts that improved, since
-  asking for high reward selects for helpful world-model errors. `dynamics="env"` is the online upper bound.
+  maze is used after generation for evaluation, including impossible moves and exact random-walk baselines.
+  `dynamics="env"` is refused for training buffers. Evaluate actual policy performance with real-maze rollouts.
 - R is relabelled to the bin achieved, never the bin requested.
 - Every head trains on the mixture (`train(mixer=RolloutBuffer(...), mix_frac=...)`). The interval identity is
   about one joint distribution; rollouts in the R head alone would make the heads disagree about it.
 - The DP ground truth describes the random walk, so `act_kl` / `value_kl` for rollout-trained runs are
-  references for a different distribution. `RolloutBuffer.history` is the readout that stays valid: asked for
-  a higher reward from a real prefix, how often does the model get one, against the exact random-walk rate
-  from the same prefixes.
+  references for a different distribution. `RolloutBuffer.history` diagnoses imagined improvement and
+  hallucinations; actual real-maze policy evaluation is needed to establish improvement.
 - `td` is refused with a mixer: its importance weight assumes the uniform behaviour policy.
+- The legacy `a` objective is disabled because it built targets from real-maze child transitions.
+  Use MC plus interval consistency; `train(consistency=True)` selects that combination.
 
 `colab/rollouts.ipynb` runs `{mc, mc_all} x {data only, + rollouts}`.
 
