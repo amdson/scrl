@@ -49,7 +49,8 @@ A `cons_sampler(params, rng, n, step)` for `train()`:
 Offline phase first, then model-proposed queries switched on at `START_LATE` (hypothesis: a longer offline
 phase gives the value head a real far-start tail, so the belief floor can work). Arms `mc_all`, `late_tilt`,
 `late_rollout`, `late_both`; small constant beta; readouts: enrichment, far-start q0 tail by distance,
-sampler histograms and floor cuts.
+sampler histograms and floor cuts. W&B logging (`metrics_fn`), per-term gradient norms (`grad_every`),
+real-maze rollout eval, and mid-run checkpoints (`ckpt_every`, resume on restart) are wired in.
 
 ## Experiments
 

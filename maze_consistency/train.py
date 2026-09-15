@@ -216,7 +216,8 @@ def make_grad_norms(model, tok: Tokenizer, lc: LossConfig):
 def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_heads=4, seed=0,
           loss: LossConfig | None = None, consistency=False, a_warmup=None,
           eval_fn=None, eval_every=0, log_every=100, log=print, cons_sampler=None, maze_kw=None,
-          mixer=None, mix_frac=0.0, init_params=None, metrics_fn=None, grad_every=0):
+          mixer=None, mix_frac=0.0, init_params=None, metrics_fn=None, grad_every=0, ckpt_every=0,
+          resume=True):
     """loss: a LossConfig (default: next-token only). consistency=True is shorthand for LossConfig(mc=True, cons=True).
     eval_fn(params, fwd) -> dict of metrics, called at step 0, every eval_every steps, and at the end.
 
@@ -264,6 +265,25 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
         f"train={n_train:,} held-out={N_HELDOUT} loss={lc}")
     rng = np.random.default_rng(seed)
     hist, tests, recent, t0 = [], [], {}, time.time()
+    out = os.path.join(RUNS_DIR, name)
+    ckpt_path = os.path.join(out, "ckpt.pkl")
+    start_step = 1
+    if resume and os.path.exists(ckpt_path):
+        with open(ckpt_path, "rb") as f:
+            ck = pickle.load(f)
+        params = jax.tree_util.tree_map(jnp.asarray, ck["params"])
+        opt_state = jax.tree_util.tree_map(lambda a: jnp.asarray(a) if isinstance(a, np.ndarray) else a, ck["opt_state"])
+        hist, tests, start_step = ck["hist"], ck["tests"], ck["step"] + 1
+        rng.bit_generator.state = ck["rng_state"]
+        log(f"  resumed from {ckpt_path} at step {ck['step']}")
+
+    def save_ckpt(i):
+        os.makedirs(out, exist_ok=True)
+        tmp = ckpt_path + ".tmp"
+        with open(tmp, "wb") as f:
+            pickle.dump(dict(params=jax.device_get(params), opt_state=jax.device_get(opt_state), step=i,
+                             hist=hist, tests=tests, rng_state=rng.bit_generator.state), f)
+        os.replace(tmp, ckpt_path)
 
     def run_eval(i):
         m = dict(step=i, **eval_fn(params, fwd))
@@ -272,11 +292,11 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
             metrics_fn(i, m, "test")
         log(f"  test@{i}: " + " ".join(f"{k} {v:.4f}" for k, v in m.items() if k != "step" and np.isscalar(v)))
 
-    if eval_fn:
+    if eval_fn and start_step == 1:
         run_eval(0)
     n_nor = batch // 2
     to_jnp = lambda tree: jax.tree_util.tree_map(jnp.asarray, tree)
-    for i in range(1, steps + 1):
+    for i in range(start_step, steps + 1):
         if mixer is not None:
             mixer.maybe_refresh(params, i)
         n_mix = int(round(mix_frac * batch)) if mixer is not None and mixer.ready else 0
@@ -311,10 +331,11 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
             if metrics_fn:
                 metrics_fn(i, hist[-1], "train")
             log(f"  step {i}: " + " ".join(f"{k} {v:.4f}" for k, v in hist[-1].items() if k != "step")
-                + f" ({(time.time() - t0) / i * 1000:.0f} ms/step)")
+                + f" ({(time.time() - t0) / (i - start_step + 1) * 1000:.0f} ms/step)")
         if eval_fn and eval_every and (i % eval_every == 0 or i == steps):
             run_eval(i)
-    out = os.path.join(RUNS_DIR, name)
+        if ckpt_every and i % ckpt_every == 0 and i < steps:
+            save_ckpt(i)
     os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, "params.pkl"), "wb") as f:
         pickle.dump(dict(params=jax.device_get(params), cfg=cfg.__dict__, loss=asdict(lc)), f)
