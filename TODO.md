@@ -54,8 +54,24 @@ real-maze rollout eval, and mid-run checkpoints (`ckpt_every`, resume on restart
 
 ## Experiments
 
-Three arms, same steps and lambda: `mc_all` with the recorded bin as query; the same with tilted data
-queries; that plus imagined conditioned rows. Then a small beta-schedule sweep. Consider geometric binning.
+First Colab run (uniform K=12, 20k steps, late switch at 12k): no benefit from either proposal source; all
+arms improved steadily on value KL / enrichment through the whole run with tf at its entropy floor, i.e. the
+bottleneck is propagation of value into rare regions, not token modelling.
+
+Now switched to **geometric binning, K=24** (`MAZE_KW` in the notebook; own exact test set
+`data/canonical/testset_geo24.npz`): optimal play spans 11 usable bins (far starts: bins 10-14) instead of 2.
+Bins 18, 21, 22 are empty. Panels/tables read the far-start best bins (`FAR_BINS`), not the top bins.
+
+Speed sweep in the notebook (`SPEED_SPECS`, 5k steps, `RUN_SPEED_SWEEP`): constant 1e-3 vs warmup+cosine 3e-3,
+model 128x4, consistency batch 32, lambda 0.5. `train()` now takes warmup / cosine / lr_end_frac; a spec may
+carry per-run train kwargs. Still untried: all-interval/multiscale vs local at scale, the one-endpoint
+stop-gradient ablation (faster one-way propagation; deadly-triad setting). Watch held-out value KL vs train
+MC for value-head memorization on long runs (>6 epochs over 100k rows).
+
+Rollouts: gate the late switch on goalward/best rather than step count; normalize the proposal term by its own
+gradient norm; select rollout rows by the model's terminal belief in the request (a legal proposal choice).
+Alternative conditioning if per-bin sparsity persists: threshold events "arrived within H" (cumulative bins,
+same head, no architecture change).
 
 ## Doc
 
