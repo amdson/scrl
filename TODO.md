@@ -52,6 +52,15 @@ phase gives the value head a real far-start tail, so the belief floor can work).
 sampler histograms and floor cuts. W&B logging (`metrics_fn`), per-term gradient norms (`grad_every`),
 real-maze rollout eval, and mid-run checkpoints (`ckpt_every`, resume on restart) are wired in.
 
+## Probe notebook: `colab/model_probe.ipynb` (`maze_consistency/probe.py`, evaluation only)
+
+Loads a run from Drive. Reward prediction along synthetic trajectories with known outcomes (optimal, detours,
+wander-then-optimal, random) vs the achieved bin and the exact DP posterior; policy mass on wall moves per
+mode vs the exact conditioned walk; dynamics-head mass off the real next cell; real-maze rollouts from every
+start conditioned on attainable bins (best, best-1, best-2) scored on the bin actually achieved, with NOR and
+exact random-walk references (`probe.conditioned_rollouts`). On the 2k-step checkpoints
+the value head gives the achieved bin only 5-30% even at the goal, so terminal recognition is itself weak.
+
 ## Experiments
 
 First Colab run (uniform K=12, 20k steps, late switch at 12k): no benefit from either proposal source; all
@@ -64,7 +73,10 @@ Bins 18, 21, 22 are empty. Panels/tables read the far-start best bins (`FAR_BINS
 
 Speed sweep in the notebook (`SPEED_SPECS`, 5k steps, `RUN_SPEED_SWEEP`): constant 1e-3 vs warmup+cosine 3e-3,
 model 128x4, consistency batch 32, lambda 0.5, and `pos_enc="rope"` (rotary attention + fixed sinusoidal
-absolute time; `ModelConfig.pos_enc`, default `learned`). Windowed/Markov attention was considered and
+absolute time; `ModelConfig.pos_enc`, default `learned`), and `mode_enc="ordinal"` (reward-bin token = linear map
+of Fourier features of the bin's log arrival-time centre + zero-init per-bin residual; `ModelConfig.mode_enc`,
+default `free`). Motivation: adjacent bins showed no transfer; each bin was an independent kind embedding, and
+bins 18/21/22 are empty under geometric K=24 so their tokens were untrained noise. Windowed/Markov attention was considered and
 rejected as depending on the test environment's simplicity. `train()` now takes warmup / cosine / lr_end_frac; a spec may
 carry per-run train kwargs. Still untried: all-interval/multiscale vs local at scale, the one-endpoint
 stop-gradient ablation (faster one-way propagation; deadly-triad setting). Watch held-out value KL vs train

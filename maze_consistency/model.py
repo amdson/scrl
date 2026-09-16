@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import jax
 import jax.numpy as jnp
 import flax.linen as nn
@@ -27,6 +28,13 @@ class ModelConfig:
     d_model: int = 64
     n_layers: int = 2
     n_heads: int = 4
+    mode_enc: str = "free"     # "free": one free embedding row per reward bin (the original).
+                               # "ordinal": the MODE token for bin k is a linear map of Fourier features of the
+                               #   bin's position on the log arrival-time scale (mode_feat[k]), plus a per-bin
+                               #   learned residual initialised at zero. Adjacent bins then share by
+                               #   construction, and sparse or empty bins interpolate from their neighbours.
+    mode0: int = -1            # kind id of bin 0 (Tokenizer.MODE0); NOR keeps its own free embedding
+    mode_feat: tuple = ()      # [K] bin positions in [-1, 1] on the log arrival-time scale (bin 0 = never)
     pos_enc: str = "learned"   # "learned": a free vector per slot index (the original).
                                # "rope": rotary positions inside attention (relative offsets, so "the most recent
                                #   state slot" is one pattern at every position) plus a FIXED sinusoidal absolute
@@ -34,7 +42,28 @@ class ModelConfig:
 
     @staticmethod
     def for_tokenizer(tok: Tokenizer, **kw) -> "ModelConfig":
-        return ModelConfig(n_kind=tok.n_kind, n_x=tok.n_x, n_y=tok.n_y, max_len=tok.L, K=tok.K, n_out=tok.n_out, **kw)
+        return ModelConfig(n_kind=tok.n_kind, n_x=tok.n_x, n_y=tok.n_y, max_len=tok.L, K=tok.K, n_out=tok.n_out,
+                           mode0=tok.MODE0, mode_feat=bin_features(tok.maze), **kw)
+
+
+def bin_features(maze) -> tuple:
+    """Each bin's centre on the log arrival-time scale, rescaled to [-1, 1]. Bin 0 (never reached) sits one
+    bin-width beyond the slowest bin. Label definitions only; no maze structure."""
+    edges = np.sort(np.asarray(maze.L_edges, dtype=np.float64))          # ascending L, K entries for K-1 bins
+    edges = np.maximum(edges, 1.0)
+    centres = np.sqrt(edges[:-1] * edges[1:])                              # bin K-1 (fastest) ... bin 1 (slowest)
+    logc = np.log(centres)[::-1]                                           # index 0 -> bin 1, ... -> bin K-1
+    width = float(np.mean(np.abs(np.diff(logc)))) if len(logc) > 1 else 1.0
+    feats = np.concatenate([[logc[0] + width], logc])                     # bin 0 beyond the slowest (logc is descending)
+    feats = 2 * (feats - feats.min()) / max(feats.max() - feats.min(), 1e-9) - 1
+    return tuple(float(f) for f in feats)
+
+
+def fourier(u, n_freq=8):
+    """[K] positions in [-1, 1] -> [K, 2 n_freq] sin/cos features at frequencies 1..n_freq (half-periods)."""
+    f = jnp.arange(1, n_freq + 1).astype(jnp.float32) * jnp.pi / 2
+    ang = jnp.asarray(u, jnp.float32)[:, None] * f[None]
+    return jnp.concatenate([jnp.sin(ang), jnp.cos(ang)], -1)
 
 
 def sinusoidal(L, D, base=10000.0):
@@ -89,7 +118,16 @@ class MazeTransformer(nn.Module):
         B, L, _ = tokens.shape
         if c.pos_enc not in ("learned", "rope"):
             raise ValueError(f"pos_enc={c.pos_enc!r} not in learned|rope")
-        x = (nn.Embed(c.n_kind, c.d_model, name="kind_emb")(tokens[..., 0])
+        if c.mode_enc not in ("free", "ordinal"):
+            raise ValueError(f"mode_enc={c.mode_enc!r} not in free|ordinal")
+        kind = tokens[..., 0]
+        kind_x = nn.Embed(c.n_kind, c.d_model, name="kind_emb")(kind)
+        if c.mode_enc == "ordinal":
+            table = (nn.Dense(c.d_model, name="mode_fourier")(fourier(jnp.asarray(c.mode_feat)))
+                     + nn.Embed(c.K, c.d_model, name="mode_residual", embedding_init=nn.initializers.zeros)(jnp.arange(c.K)))
+            is_mode = (kind >= c.mode0) & (kind < c.mode0 + c.K)
+            kind_x = jnp.where(is_mode[..., None], table[jnp.clip(kind - c.mode0, 0, c.K - 1)], kind_x)
+        x = (kind_x
              + nn.Embed(c.n_x, c.d_model, name="x_emb")(tokens[..., 1])
              + nn.Embed(c.n_y, c.d_model, name="y_emb")(tokens[..., 2])
              + nn.Embed(c.n_types, c.d_model, name="type_emb")(types)[None])
