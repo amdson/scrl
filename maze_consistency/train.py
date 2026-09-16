@@ -217,7 +217,7 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
           loss: LossConfig | None = None, consistency=False, a_warmup=None,
           eval_fn=None, eval_every=0, log_every=100, log=print, cons_sampler=None, maze_kw=None,
           mixer=None, mix_frac=0.0, init_params=None, metrics_fn=None, grad_every=0, ckpt_every=0,
-          resume=True, warmup=0, cosine=False, lr_end_frac=0.1):
+          resume=True, warmup=0, cosine=False, lr_end_frac=0.1, pos_enc="learned"):
     """loss: a LossConfig (default: next-token only). consistency=True is shorthand for LossConfig(mc=True, cons=True).
     eval_fn(params, fwd) -> dict of metrics, called at step 0, every eval_every steps, and at the end.
 
@@ -251,7 +251,7 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
     maze, d = load(**(maze_kw or {}))      # maze_kw={"binning": ..., "n_bins": ...} relabels outcomes only
     tok = Tokenizer(maze)
     n_train = len(d["length"]) - N_HELDOUT
-    cfg = ModelConfig.for_tokenizer(tok, d_model=d_model, n_layers=n_layers, n_heads=n_heads)
+    cfg = ModelConfig.for_tokenizer(tok, d_model=d_model, n_layers=n_layers, n_heads=n_heads, pos_enc=pos_enc)
     model = MazeTransformer(cfg)
     params = model.init(jax.random.PRNGKey(seed), jnp.asarray(tok.blank(1)), jnp.asarray(tok.types))["params"]
     if init_params is not None:
@@ -268,7 +268,7 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
     grad_norms = make_grad_norms(model, tok, lc) if grad_every else None
     fwd = make_forward(model, tok) if eval_fn else None
     log(f"[{name}] maze={maze.H}x{maze.W} T={maze.T} K={maze.K} params={count_params(params):,} "
-        f"train={n_train:,} held-out={N_HELDOUT} lr={lr} warmup={warmup} cosine={cosine} loss={lc}")
+        f"train={n_train:,} held-out={N_HELDOUT} lr={lr} warmup={warmup} cosine={cosine} pos={pos_enc} loss={lc}")
     rng = np.random.default_rng(seed)
     hist, tests, recent, t0 = [], [], {}, time.time()
     out = os.path.join(RUNS_DIR, name)

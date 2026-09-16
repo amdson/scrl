@@ -63,7 +63,9 @@ Now switched to **geometric binning, K=24** (`MAZE_KW` in the notebook; own exac
 Bins 18, 21, 22 are empty. Panels/tables read the far-start best bins (`FAR_BINS`), not the top bins.
 
 Speed sweep in the notebook (`SPEED_SPECS`, 5k steps, `RUN_SPEED_SWEEP`): constant 1e-3 vs warmup+cosine 3e-3,
-model 128x4, consistency batch 32, lambda 0.5. `train()` now takes warmup / cosine / lr_end_frac; a spec may
+model 128x4, consistency batch 32, lambda 0.5, and `pos_enc="rope"` (rotary attention + fixed sinusoidal
+absolute time; `ModelConfig.pos_enc`, default `learned`). Windowed/Markov attention was considered and
+rejected as depending on the test environment's simplicity. `train()` now takes warmup / cosine / lr_end_frac; a spec may
 carry per-run train kwargs. Still untried: all-interval/multiscale vs local at scale, the one-endpoint
 stop-gradient ablation (faster one-way propagation; deadly-triad setting). Watch held-out value KL vs train
 MC for value-head memorization on long runs (>6 epochs over 100k rows).

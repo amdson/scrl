@@ -27,15 +27,41 @@ class ModelConfig:
     d_model: int = 64
     n_layers: int = 2
     n_heads: int = 4
+    pos_enc: str = "learned"   # "learned": a free vector per slot index (the original).
+                               # "rope": rotary positions inside attention (relative offsets, so "the most recent
+                               #   state slot" is one pattern at every position) plus a FIXED sinusoidal absolute
+                               #   embedding of the slot index, which is elapsed time -- the value head needs it.
 
     @staticmethod
     def for_tokenizer(tok: Tokenizer, **kw) -> "ModelConfig":
         return ModelConfig(n_kind=tok.n_kind, n_x=tok.n_x, n_y=tok.n_y, max_len=tok.L, K=tok.K, n_out=tok.n_out, **kw)
 
 
+def sinusoidal(L, D, base=10000.0):
+    """Fixed absolute embedding [L, D] of slot index: sin/cos at geometrically spaced frequencies."""
+    pos = jnp.arange(L)[:, None].astype(jnp.float32)
+    freq = base ** (-jnp.arange(0, D, 2).astype(jnp.float32) / D)
+    ang = pos * freq[None]
+    return jnp.concatenate([jnp.sin(ang), jnp.cos(ang)], -1)[:, :D]
+
+
+def rope(x, base=10000.0):
+    """Rotary position embedding on [B, L, H, d]: rotate each (even, odd) pair of features by an angle that
+    grows linearly with the slot index, so q.k depends on the offset between slots, not their absolute index."""
+    B, L, H, d = x.shape
+    half = d // 2
+    freq = base ** (-jnp.arange(half).astype(jnp.float32) / half)
+    ang = jnp.arange(L).astype(jnp.float32)[:, None] * freq[None]              # [L, half]
+    cos, sin = jnp.cos(ang)[None, :, None, :], jnp.sin(ang)[None, :, None, :]
+    x1, x2 = x[..., :half], x[..., half:2 * half]
+    out = jnp.concatenate([x1 * cos - x2 * sin, x1 * sin + x2 * cos], -1)
+    return out if 2 * half == d else jnp.concatenate([out, x[..., 2 * half:]], -1)
+
+
 class Block(nn.Module):
     d_model: int
     n_heads: int
+    use_rope: bool = False
 
     @nn.compact
     def __call__(self, x, mask):
@@ -44,6 +70,8 @@ class Block(nn.Module):
         y = nn.LayerNorm()(x)
         qkv = nn.Dense(3 * D)(y).reshape(B, L, 3, H, D // H)
         q, k, v = qkv[:, :, 0], qkv[:, :, 1], qkv[:, :, 2]
+        if self.use_rope:
+            q, k = rope(q), rope(k)
         att = jnp.einsum("bqhd,bkhd->bhqk", q, k) / jnp.sqrt(D // H)
         att = jax.nn.softmax(jnp.where(mask, att, jnp.finfo(att.dtype).min), axis=-1)
         x = x + nn.Dense(D)(jnp.einsum("bhqk,bkhd->bqhd", att, v).reshape(B, L, D))
@@ -59,14 +87,19 @@ class MazeTransformer(nn.Module):
         """tokens int32 [B, L, 3] = (kind, x, y); returns next-token logits [B, L, n_out], value logits [B, L, K]."""
         c = self.cfg
         B, L, _ = tokens.shape
+        if c.pos_enc not in ("learned", "rope"):
+            raise ValueError(f"pos_enc={c.pos_enc!r} not in learned|rope")
         x = (nn.Embed(c.n_kind, c.d_model, name="kind_emb")(tokens[..., 0])
              + nn.Embed(c.n_x, c.d_model, name="x_emb")(tokens[..., 1])
              + nn.Embed(c.n_y, c.d_model, name="y_emb")(tokens[..., 2])
-             + nn.Embed(c.n_types, c.d_model, name="type_emb")(types)[None]
-             + nn.Embed(c.max_len, c.d_model, name="pos_emb")(jnp.arange(L))[None])
+             + nn.Embed(c.n_types, c.d_model, name="type_emb")(types)[None])
+        if c.pos_enc == "learned":
+            x = x + nn.Embed(c.max_len, c.d_model, name="pos_emb")(jnp.arange(L))[None]
+        else:
+            x = x + sinusoidal(L, c.d_model)[None]                     # absolute slot index = elapsed time, fixed
         mask = jnp.tril(jnp.ones((L, L), dtype=bool))[None, None]
         for i in range(c.n_layers):
-            x = Block(c.d_model, c.n_heads, name=f"block{i}")(x, mask)
+            x = Block(c.d_model, c.n_heads, use_rope=(c.pos_enc == "rope"), name=f"block{i}")(x, mask)
         x = nn.LayerNorm(name="ln_f")(x)
         return {"next": nn.Dense(c.n_out, name="next_head")(x),
                 "value": nn.Dense(c.K, name="value_head")(x)}
