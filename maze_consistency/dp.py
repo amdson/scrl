@@ -55,6 +55,22 @@ def compute_ground_truth(maze: Maze) -> GroundTruth:
     return GroundTruth(maze, h, child_h, np.transpose(piR, (0, 1, 3, 2)), V_opt, Q_opt, d, is_goal)
 
 
+def event_ground_truth(gt: GroundTruth) -> GroundTruth:
+    """The same ground truth for THRESHOLD events "bin k or faster": h and child_h become tail sums over bins
+    >= k, and piR_star becomes the exact policy conditioned on the event (child tail / 4 parent tail). Token 0
+    is the sure event, so its conditioned policy is the uniform walk. Everything else is unchanged."""
+    H = np.cumsum(gt.h[..., ::-1], -1)[..., ::-1]
+    CH = np.cumsum(gt.child_h[..., ::-1], -1)[..., ::-1]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        piE = (CH / N_ACTIONS) / H[:gt.maze.T, :, None, :]
+    return GroundTruth(gt.maze, H, CH, np.transpose(piE, (0, 1, 3, 2)), gt.V_opt, gt.Q_opt, gt.d, gt.is_goal)
+
+
+def truth_for(gt: GroundTruth, cond: str) -> GroundTruth:
+    """The ground truth matching a Tokenizer's conditioning semantics (see Tokenizer.cond)."""
+    return event_ground_truth(gt) if cond == "threshold" else gt
+
+
 def check_identities(gt: GroundTruth) -> dict:
     """(B) holds exactly for h, and pi_R* sums to one wherever it is defined."""
     m, ng = gt.maze, ~gt.is_goal

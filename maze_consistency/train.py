@@ -78,11 +78,18 @@ def merge_rows(d, idx, extra):
             for k in ("positions", "actions", "length", "reached")}
 
 
-def make_batch(tok: Tokenizer, maze, d, idx, p_nor=0.5):
-    """First round(p_nor * B) rows in NOR mode, the rest with MODE = the rollout's own outcome bin."""
+def make_batch(tok: Tokenizer, maze, d, idx, p_nor=0.5, modes=None):
+    """First round(p_nor * B) rows in NOR mode, the rest with MODE = the rollout's own outcome bin, or `modes`
+    [B] (a bin per row; -1 = NOR) when given -- cond="threshold" passes each conditioned row's sampled
+    satisfied threshold."""
     body = tok.encode_body(d["positions"][idx], d["actions"][idx], d["length"][idx])
-    x = tok.with_mode(body, maze.outcome_bin(d["length"][idx], d["reached"][idx]))
-    x[:int(round(len(idx) * p_nor)), 0] = tok.mode(None)
+    if modes is None:
+        x = tok.with_mode(body, maze.outcome_bin(d["length"][idx], d["reached"][idx]))
+        x[:int(round(len(idx) * p_nor)), 0] = tok.mode(None)
+    else:
+        modes = np.asarray(modes)
+        x = tok.with_mode(body, np.maximum(modes, 0))
+        x[modes < 0, 0] = tok.mode(None)
     tgt, mask = tok.next_targets(x)
     return x, tgt, mask
 
@@ -217,7 +224,8 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
           loss: LossConfig | None = None, consistency=False, a_warmup=None,
           eval_fn=None, eval_every=0, log_every=100, log=print, cons_sampler=None, maze_kw=None,
           mixer=None, mix_frac=0.0, init_params=None, metrics_fn=None, grad_every=0, ckpt_every=0,
-          resume=True, warmup=0, cosine=False, lr_end_frac=0.1, pos_enc="learned", mode_enc="free"):
+          resume=True, warmup=0, cosine=False, lr_end_frac=0.1, pos_enc="learned", mode_enc="free",
+          cond="bin"):
     """loss: a LossConfig (default: next-token only). consistency=True is shorthand for LossConfig(mc=True, cons=True).
     eval_fn(params, fwd) -> dict of metrics, called at step 0, every eval_every steps, and at the end.
 
@@ -238,7 +246,18 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
     state is fresh either way.
 
     metrics_fn(step, metrics, kind): optional sink for a logger such as wandb. kind="train" gets the averaged
-    loss parts at every log_every steps; kind="test" gets the eval_fn dict at every checkpoint."""
+    loss parts at every log_every steps; kind="test" gets the eval_fn dict at every checkpoint.
+
+    grad_every: every this many steps, log each term's gradient norm taken alone (make_grad_norms) as gnorm/*
+    and cons_rows/*. ckpt_every: save params, optimizer state, step, histories and the data RNG to
+    RUNS_DIR/name/ckpt.pkl; with resume=True a run whose ckpt.pkl exists continues from it. warmup / cosine:
+    learning-rate schedule (linear warmup to lr, cosine decay to lr * lr_end_frac); its counter lives in the
+    optimizer state, so it survives a resume. pos_enc / mode_enc: ModelConfig options.
+
+    cond: Tokenizer.cond. "threshold" makes a reward token mean "this bin or faster": the conditioned half of
+    every batch and the default consistency batch are then (row, satisfied threshold) pairs drawn uniformly
+    (consistency.threshold_pairs), and the consistency term reads the value head's tail sum for the query.
+    The NOR half, the MC target and the model are unchanged."""
     lc = loss or (LossConfig(mc=True, cons=True) if consistency else LossConfig())
     if a_warmup is not None:
         lc = replace(lc, a_warmup=a_warmup)
@@ -249,7 +268,7 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
         raise ValueError("td's importance weight assumes the uniform behaviour policy, which model-generated "
                          "rows do not follow -- use mc with a mixer")
     maze, d = load(**(maze_kw or {}))      # maze_kw={"binning": ..., "n_bins": ...} relabels outcomes only
-    tok = Tokenizer(maze)
+    tok = Tokenizer(maze, cond=cond)
     n_train = len(d["length"]) - N_HELDOUT
     cfg = ModelConfig.for_tokenizer(tok, d_model=d_model, n_layers=n_layers, n_heads=n_heads, pos_enc=pos_enc,
                                     mode_enc=mode_enc)
@@ -269,7 +288,7 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
     grad_norms = make_grad_norms(model, tok, lc) if grad_every else None
     fwd = make_forward(model, tok) if eval_fn else None
     log(f"[{name}] maze={maze.H}x{maze.W} T={maze.T} K={maze.K} params={count_params(params):,} "
-        f"train={n_train:,} held-out={N_HELDOUT} lr={lr} warmup={warmup} cosine={cosine} pos={pos_enc} mode={mode_enc} loss={lc}")
+        f"train={n_train:,} held-out={N_HELDOUT} lr={lr} warmup={warmup} cosine={cosine} pos={pos_enc} mode={mode_enc} cond={cond} loss={lc}")
     rng = np.random.default_rng(seed)
     hist, tests, recent, t0 = [], [], {}, time.time()
     out = os.path.join(RUNS_DIR, name)
@@ -303,21 +322,33 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
         run_eval(0)
     n_nor = batch // 2
     to_jnp = lambda tree: jax.tree_util.tree_map(jnp.asarray, tree)
+    pairs = C.threshold_pairs(maze, d, n_train) if cond == "threshold" else None
+    if pairs is not None and mixer is not None:
+        raise ValueError("cond='threshold' does not support a mixer")
     for i in range(start_step, steps + 1):
         if mixer is not None:
             mixer.maybe_refresh(params, i)
         n_mix = int(round(mix_frac * batch)) if mixer is not None and mixer.ready else 0
-        idx = rng.integers(0, n_train, batch - n_mix)
-        if n_mix:                                    # rollout rows land in both the NOR and the R half
-            src, bidx = merge_rows(d, idx, mixer.rows(rng, n_mix)), rng.permutation(batch)
+        if pairs is not None:                        # NOR half uniform; conditioned half = (row, threshold) pairs
+            idx_nor = rng.integers(0, n_train, n_nor)
+            idx_r, k_r = C.sample_threshold_rows(pairs, rng, batch - n_nor)
+            src, bidx = d, np.concatenate([idx_nor, idx_r])
+            x, tgt, mask = make_batch(tok, maze, d, bidx, modes=np.concatenate([np.full(n_nor, -1), k_r]))
         else:
-            src, bidx = d, idx
-        x, tgt, mask = make_batch(tok, maze, src, bidx)
+            idx = rng.integers(0, n_train, batch - n_mix)
+            if n_mix:                                # rollout rows land in both the NOR and the R half
+                src, bidx = merge_rows(d, idx, mixer.rows(rng, n_mix)), rng.permutation(batch)
+            else:
+                src, bidx = d, idx
+            x, tgt, mask = make_batch(tok, maze, src, bidx)
         cb = value_batch(maze, src, bidx[:n_nor]) if lc.main_value else {}
         if not lc.cons:
             nb = {}
         elif cons_sampler is not None:
             nb = cons_sampler(params, rng, lc.cons_batch, i)
+        elif pairs is not None:
+            ci, ck = C.sample_threshold_rows(pairs, rng, lc.cons_batch)
+            nb = C.rollout_batch(tok, maze, d, ci, R_bin=ck)
         elif n_mix:
             n_c = int(round(mix_frac * lc.cons_batch))
             csrc = merge_rows(d, rng.integers(0, n_train, lc.cons_batch - n_c), mixer.rows(rng, n_c))
@@ -345,7 +376,7 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
             save_ckpt(i)
     os.makedirs(out, exist_ok=True)
     with open(os.path.join(out, "params.pkl"), "wb") as f:
-        pickle.dump(dict(params=jax.device_get(params), cfg=cfg.__dict__, loss=asdict(lc)), f)
+        pickle.dump(dict(params=jax.device_get(params), cfg=cfg.__dict__, loss=asdict(lc), cond=cond), f)
     with open(os.path.join(out, "history.json"), "w") as f:
         json.dump(dict(train=hist, test=tests), f)
     return params, cfg

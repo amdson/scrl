@@ -206,6 +206,46 @@ def interval_stats_by_length(c, lengths, max_pairs=None):
     return ell, np.sqrt(sq[keep] / cnt[keep]), cnt[keep]
 
 
+# ---- conditioning semantics --------------------------------------------------------------------
+
+def event_logprob(logq, k, cond, K):
+    """log-probability of query k under a log-categorical logq [..., K] (jnp): the bin itself (cond="bin") or
+    the tail sum over bins >= k (cond="threshold"). k broadcasts against logq's leading dims."""
+    k = jnp.asarray(k)
+    if cond == "bin":
+        return jnp.take_along_axis(logq, jnp.broadcast_to(k[..., None], logq.shape[:-1] + (1,)), -1)[..., 0]
+    mask = jnp.arange(K) >= k[..., None]
+    return jax.nn.logsumexp(jnp.where(mask, logq, -jnp.inf), -1)
+
+
+def event_logprob_np(logq, k, cond, K):
+    """numpy twin of event_logprob."""
+    k = np.asarray(k)
+    if cond == "bin":
+        return np.take_along_axis(logq, np.broadcast_to(k[..., None], logq.shape[:-1] + (1,)), -1)[..., 0]
+    mask = np.arange(K) >= k[..., None]
+    z = np.where(mask, logq, -np.inf)
+    m = z.max(-1, keepdims=True)
+    return (m + np.log(np.exp(z - m).sum(-1, keepdims=True)))[..., 0]
+
+
+def threshold_pairs(maze, d, n_rows):
+    """Index for sampling (row, satisfied threshold) pairs uniformly among the first n_rows of d: a row that
+    achieved bin b carries b such pairs (k = 1..b), so P(row | k) is exactly the data conditioned on the event
+    "bin k or faster". Failed rows carry none. Returns (rows, cum) for sample_threshold_rows."""
+    b = maze.outcome_bin(d["length"][:n_rows], d["reached"][:n_rows]).astype(np.int64)
+    rows = np.flatnonzero(b > 0)
+    return rows, np.concatenate([[0], np.cumsum(b[rows])])
+
+
+def sample_threshold_rows(pairs, rng, n):
+    """n (row, k) draws, uniform over pairs (threshold_pairs)."""
+    rows, cum = pairs
+    u = rng.integers(0, cum[-1], n)
+    i = np.searchsorted(cum, u, side="right") - 1
+    return rows[i], (u - cum[i] + 1).astype(np.int32)
+
+
 # ---- getting u, v, b out of the model ----------------------------------------------------------
 
 def make_terms_fn(model, tok, jit=True):
@@ -229,7 +269,7 @@ def make_terms_fn(model, tok, jit=True):
         lp_n, lp_r = gather(out_n["next"], targets), gather(out_r["next"], targets)
         B = x_nor.shape[0]
         logq = jax.nn.log_softmax(out_n["value"][:, sn].astype(jnp.float32), -1)      # [B, T+1, K]
-        b = jnp.take_along_axis(logq, R_bin[:, None, None].repeat(sn.size, 1), -1)[..., 0]
+        b = event_logprob(logq, R_bin[:, None], tok.cond, tok.K)                      # bin, or tail sum
         u_pi, u_dyn = lp_n[:, sa], lp_n[:, sa + 1]
         v_pi, v_dyn = lp_r[:, sa], lp_r[:, sa + 1]
         return dict(u=u_pi + u_dyn, v=v_pi + v_dyn, b=b,
@@ -239,10 +279,14 @@ def make_terms_fn(model, tok, jit=True):
     return jax.jit(terms) if jit else terms
 
 
-def rollout_batch(tok, maze, d, idx):
-    """Host-side inputs for one batch of rollouts: the NOR and R token arrays, shared targets, R bin, length."""
+def rollout_batch(tok, maze, d, idx, R_bin=None):
+    """Host-side inputs for one batch of rollouts: the NOR and R token arrays, shared targets, R bin, length.
+    R_bin defaults to each row's achieved bin -- under cond="threshold" that is its tightest satisfied
+    threshold. Pass R_bin explicitly for other queries (sample_threshold_rows, proposals)."""
     body = tok.encode_body(d["positions"][idx], d["actions"][idx], d["length"][idx])
-    R_bin = maze.outcome_bin(d["length"][idx], d["reached"][idx]).astype(np.int32)
+    if R_bin is None:
+        R_bin = maze.outcome_bin(d["length"][idx], d["reached"][idx])
+    R_bin = np.asarray(R_bin).astype(np.int32)
     x_nor, x_R = tok.with_mode(body, None), tok.with_mode(body, R_bin)
     targets, _ = tok.next_targets(x_nor)
     return dict(x_nor=x_nor, x_R=x_R, targets=targets, R_bin=R_bin,
@@ -277,11 +321,7 @@ def make_tilted_sampler(model, tok, maze, d, n_train, beta, floor=0.0, truncate=
         x_nor = tok.with_mode(body, None)
         logq = _log_softmax_np(np.asarray(q0_logits(params, jnp.asarray(x_nor[:, :2]))).astype(np.float64))
         b = beta(step) if callable(beta) else float(beta)
-        logits = logq + b * r_k[None]
-        if floor > 0:
-            logits = np.where(logq < np.log(floor), -np.inf, logits)
-        p = np.exp(logits - logits.max(-1, keepdims=True)); p /= p.sum(-1, keepdims=True)
-        R_bin = np.minimum((rng.random(n)[:, None] > p.cumsum(-1)).sum(-1), maze.K - 1).astype(np.int32)
+        R_bin = _tilted_query(logq, b, r_k, floor, tok, rng)
         lengths, n_cut = d["length"][idx].astype(np.int32), 0
         if trunc is not None:
             lengths, n_cut = trunc(params, x_nor, R_bin, lengths)
@@ -305,7 +345,7 @@ def make_belief_truncation(model, tok, floor):
     def truncate(params, x_nor, R_bin, lengths):
         logq = np.asarray(fwd(params, jnp.asarray(x_nor))["v_logits"]).astype(np.float64)   # [B, T+1, K]
         logq = _log_softmax_np(logq)
-        bq = np.take_along_axis(logq, np.asarray(R_bin)[:, None, None], -1)[..., 0]            # [B, T+1]
+        bq = event_logprob_np(logq, np.asarray(R_bin)[:, None], tok.cond, tok.K)               # [B, T+1]
         below = bq < np.log(floor)
         first = np.where(below.any(1), below.argmax(1), lengths + 1)                         # prefix index
         new = np.minimum(lengths, np.maximum(first - 1, 1)).astype(np.int32)                  # >= 1 step
@@ -352,32 +392,33 @@ def make_rollout_sampler(model, tok, maze, d, n_train, request="highest", beta=0
             body = tok.encode_body(d["positions"][idx], d["actions"][idx], L)
             logq = _log_softmax_np(np.asarray(q0_logits(params, jnp.asarray(tok.with_mode(body, None)[:, :2]))).astype(np.float64))
             b = beta(step) if callable(beta) else float(beta)
-            logits = logq + b * r_k[None]
-            if floor > 0:
-                logits = np.where(logq < np.log(floor), -np.inf, logits)
-            p = np.exp(logits - logits.max(-1, keepdims=True)); p /= p.sum(-1, keepdims=True)
-            req = np.minimum((rng.random(buffer_n)[:, None] > p.cumsum(-1)).sum(-1), maze.K - 1).astype(np.int32)
+            req = _tilted_query(logq, b, r_k, floor, tok, rng)
         ro = continue_rollout(params, state_logits, tok, maze, d["positions"][idx], d["actions"][idx], tau, req, rng,
                               cell_logits=cell_logits, learned_end=True, max_steps=max_steps)
-        x = ro["x"]
+        keep = ro["length"].astype(np.int64) > tau            # a rollout that emitted END at once has no
+        if keep.sum() < 2:                                      # transitions: nothing to enforce, and n = 0 would
+            keep[:] = True                                      # divide the per-row loss by zero
+        x = ro["x"][keep]
+        req = req[keep]
         x_nor = tok.with_mode(x, None)
-        lengths = ro["length"].astype(np.int32)
+        lengths = np.maximum(ro["length"][keep].astype(np.int32), 1)
         n_cut = 0
         if truncate is not None:
             lengths, n_cut = truncate(params, x_nor, req, lengths)
         targets, _ = tok.next_targets(x_nor)
         state["buf"] = dict(x_nor=x_nor, x_R=tok.with_mode(x, req), targets=targets, R_bin=req.astype(np.int32),
                             lengths=lengths)
+        state["n_buf"] = len(lengths)
         state["ro"], state["tau"], state["ro_step"] = ro, tau, int(step)   # for evaluate.imagined_rollout_eval only
         sampler.history.append(dict(step=int(step), ended=float(ro["reached"].mean()),
                                     mean_len=float(ro["length"].mean()), mean_used=float(lengths.mean()),
-                                    n_cut=n_cut, bins=np.bincount(req, minlength=maze.K)))
+                                    n_cut=n_cut, n_empty=int((~keep).sum()), bins=np.bincount(req, minlength=maze.K)))
 
     def sampler(params, rng, n, step):
         if step - state["last"] >= refresh_every:
             refresh(params, rng, step)
             state["last"] = step
-        i = rng.integers(0, buffer_n, n)
+        i = rng.integers(0, state["n_buf"], n)
         return {k: v[i] for k, v in state["buf"].items()}
 
     sampler.history = []
@@ -398,8 +439,13 @@ def make_phased_sampler(tok, maze, d, n_train, late, start, fracs=None, keep_rec
     late = list(late)
     fracs = np.full(len(late), 1.0 / len(late)) if fracs is None else np.asarray(fracs, dtype=float) / np.sum(fracs)
 
+    pairs = threshold_pairs(maze, d, n_train) if tok.cond == "threshold" else None
+
     def recorded(params, rng, n, step):
-        return rollout_batch(tok, maze, d, rng.integers(0, n_train, n))
+        if pairs is None:
+            return rollout_batch(tok, maze, d, rng.integers(0, n_train, n))
+        idx, k = sample_threshold_rows(pairs, rng, n)
+        return rollout_batch(tok, maze, d, idx, R_bin=k)
 
     def sampler(params, rng, n, step):
         if step < start:
@@ -417,6 +463,22 @@ def make_phased_sampler(tok, maze, d, n_train, late, start, fracs=None, keep_rec
 def _log_softmax_np(z):
     z = z - z.max(-1, keepdims=True)
     return z - np.log(np.exp(z).sum(-1, keepdims=True))
+
+
+def _tilted_query(logq, beta, r_k, floor, tok, rng):
+    """Query bins ~ belief(k) * exp(beta r_k), with belief the categorical (cond="bin") or its tail sums over
+    k >= 1 (cond="threshold"; token 0 is the sure event and is never queried). Bins below `floor` are dropped
+    before tilting."""
+    K = tok.K
+    ks = np.arange(K)
+    logb = event_logprob_np(logq[:, None, :], ks[None, :], tok.cond, K)                  # [n, K]
+    logits = logb + beta * r_k[None]
+    if floor > 0:
+        logits = np.where(logb < np.log(floor), -np.inf, logits)
+    if tok.cond == "threshold":
+        logits[:, 0] = -np.inf
+    p = np.exp(logits - logits.max(-1, keepdims=True)); p /= p.sum(-1, keepdims=True)
+    return np.minimum((rng.random(len(p))[:, None] > p.cumsum(-1)).sum(-1), K - 1).astype(np.int32)
 
 
 def data_nll(lp, mask):
@@ -465,9 +527,11 @@ def exact_terms(maze, gt, positions, actions, lengths, R_bins, n_max=None):
             np.where(node, np.nan_to_num(b), 0.0))
 
 
-def exact_losses(maze, gt, d, idx):
-    """Every consistency loss for the true model on rollouts `idx` of dataset `d`. All ~0."""
-    u, v, b = exact_terms(maze, gt, d["positions"][idx], d["actions"][idx], d["length"][idx],
+def exact_losses(maze, gt, d, idx, cond="bin"):
+    """Every consistency loss for the true model on rollouts `idx` of dataset `d`. All ~0. cond="threshold"
+    scores the same rows queried at their tightest satisfied threshold against the event ground truth."""
+    from .dp import truth_for
+    u, v, b = exact_terms(maze, truth_for(gt, cond), d["positions"][idx], d["actions"][idx], d["length"][idx],
                           maze.outcome_bin(d["length"][idx], d["reached"][idx]))
     r = residuals(u, v, b, d["length"][idx])
     return all_losses(r), r

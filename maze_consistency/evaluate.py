@@ -356,6 +356,8 @@ def conditioning_response(params, model, tok: Tokenizer, maze, gt, cells=None, c
                              for i in range(0, n, chunk)])
         return np.exp(_log_softmax(lg.astype(np.float64)))
 
+    from .dp import truth_for
+    gt = truth_for(gt, tok.cond)
     q = np.stack([policy(m) for m in [None] + list(range(K))])            # [K+1, n, 4]
     p = np.transpose(gt.piR_star[0, cells], (1, 0, 2))                    # [K, n, 4]
     feasible = gt.h[0, cells].T > 0                                       # [K, n]
@@ -418,6 +420,8 @@ def prefix_response(params, model, tok: Tokenizer, maze, gt, d, idx,
         q.append(np.exp(_log_softmax(pi.astype(np.float64))))
     q = np.stack(q)                                                         # [K, N, T, 4]
 
+    from .dp import truth_for
+    gt = truth_for(gt, tok.cond)
     p = np.transpose(gt.piR_star[ts, pos], (2, 0, 1, 3))                    # [K, N, T, 4] exact
     feas = np.transpose(gt.h[ts, pos] > 0, (2, 0, 1)) & valid[None]         # [K, N, T]
     p = np.where(feas[..., None], np.nan_to_num(p), 0.25)
@@ -479,13 +483,21 @@ def make_enrichment_eval(tok: Tokenizer, maze, d, n=128, seed=0, chunk=64):
     closer = np.stack([maze.dist[maze.next_open[pos, a]] < maze.dist[pos] for a in range(N_ACTIONS)], -1)
     nn = np.arange(n)[:, None]
 
-    def score_q(q):                                    # q [K, n, T, 4] -> (fail, best, enrichment) in %
+    # Under cond="threshold" the "fail" reference is NOR (token 0 is the sure event, which the training rows never
+    # carry) and the exact conditionals are the event ground truth.
+    from .dp import truth_for
+    threshold = tok.cond == "threshold"
+    x_nor = tok.with_mode(body, None)
+
+    def score_q(q, q_fail=None):                       # q [K, n, T, 4] -> (fail, best, enrichment) in %
         g = (q * closer[None]).sum(-1)
-        fail, best = g[0][use], g[k_best, nn, ts][use]
+        gf = g[0] if q_fail is None else (q_fail * closer).sum(-1)
+        fail, best = gf[use], g[k_best, nn, ts][use]
         return 100 * fail.mean(), 100 * best.mean(), 100 * (best - fail).mean()
 
-    gt = compute_ground_truth(maze)
-    ceiling = score_q(np.nan_to_num(np.transpose(gt.piR_star[ts, pos], (2, 0, 1, 3)), nan=0.25))[2]
+    gt = truth_for(compute_ground_truth(maze), tok.cond)
+    p_exact = np.nan_to_num(np.transpose(gt.piR_star[ts, pos], (2, 0, 1, 3)), nan=0.25)
+    ceiling = score_q(p_exact, np.full(p_exact.shape[1:], 0.25) if threshold else None)[2]
 
     def fn(params, fwd):
         q = []
@@ -494,7 +506,12 @@ def make_enrichment_eval(tok: Tokenizer, maze, d, n=128, seed=0, chunk=64):
                                  for i in range(0, n, chunk)]).astype(np.float64)
             q.append(np.exp(_log_softmax(lg)))
         q = np.stack(q)
-        fail, best, delta = score_q(q)
+        q_fail = None
+        if threshold:
+            lg = np.concatenate([np.asarray(fwd(params, jnp.asarray(x_nor[i:i + chunk]))["pi_logits"][:, :T])
+                                 for i in range(0, n, chunk)]).astype(np.float64)
+            q_fail = np.exp(_log_softmax(lg))
+        fail, best, delta = score_q(q, q_fail)
         out = {"enrich/points": delta, "enrich/frac_of_exact": delta / ceiling if ceiling else np.nan,
                "goalward/fail": fail, "goalward/best": best}
         g = (q * closer[None]).sum(-1)                 # [K, n, T] goalward mass when asking each bin

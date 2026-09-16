@@ -153,6 +153,8 @@ def impossible_moves(fwd, params, tok, maze, gt, traj, modes=(None,), chunk=64):
     pos, act = traj["positions"].astype(np.int64)[:, :T], traj["actions"].astype(np.int64)
     hits_wall = np.stack([maze.next_open[pos, a] == pos for a in range(N_ACTIONS)], -1)      # [N, T, 4]
     real_next = maze.next_open[pos, act]
+    from .dp import truth_for
+    gt = truth_for(gt, tok.cond)
     out = {}
     for mode in modes:
         x = tok.encode(traj, R_bin=None if mode is None else np.full(N, mode))

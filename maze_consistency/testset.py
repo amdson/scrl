@@ -52,9 +52,13 @@ def exact_rollouts(maze, gt, starts, bins, rng):
     return dict(positions=positions, actions=actions, length=length, reached=~alive, act_probs=act_probs)
 
 
-def build_testset(maze, n_per=200, seed=7, path=TEST_PATH, log=print):
-    gt = compute_ground_truth(maze)
-    tok = Tokenizer(maze)
+def build_testset(maze, n_per=200, seed=7, path=TEST_PATH, log=print, cond="bin"):
+    """cond="threshold": the "bin k" settings are the exact process conditioned on "bin k or faster" (token 0,
+    the sure event, is skipped), from the event ground truth; `value` stays the categorical h."""
+    from .dp import truth_for
+    gt0 = compute_ground_truth(maze)
+    gt = truth_for(gt0, cond)
+    tok = Tokenizer(maze, cond=cond)
     rng = np.random.default_rng(seed)
     cells = maze.start_cells
     start_nor = np.zeros(maze.n_cells)
@@ -66,7 +70,7 @@ def build_testset(maze, n_per=200, seed=7, path=TEST_PATH, log=print):
     # rollout to draw. Geometric binning produces these at large K (see Maze.empty_bins); leave the row at 0
     # and drop the setting rather than dividing by zero and sampling from NaN.
     start_R = np.divide(start_R, tot, out=np.zeros_like(start_R), where=tot > 0)
-    unreachable = [k for k in range(maze.K) if tot[k, 0] <= 0]
+    unreachable = [k for k in range(maze.K) if tot[k, 0] <= 0] + ([0] if cond == "threshold" else [])
     if unreachable:
         log(f"  skipping unreachable bins {unreachable} (h = 0 everywhere; no conditioned rollout exists)")
     names = (["NOR"] + [f"bin {k}" for k in range(maze.K) if k not in unreachable] + ["best far"])
@@ -85,14 +89,18 @@ def build_testset(maze, n_per=200, seed=7, path=TEST_PATH, log=print):
     ro = exact_rollouts(maze, gt, starts, bins, rng)
     achieved = maze.outcome_bin(ro["length"], ro["reached"])
     r = bins >= 0
-    assert (achieved[r] == bins[r]).all(), "exact conditioned rollouts must land in the requested bin"
+    if cond == "threshold":
+        assert (achieved[r] >= bins[r]).all(), "exact event-conditioned rollouts must satisfy the requested threshold"
+    else:
+        assert (achieved[r] == bins[r]).all(), "exact conditioned rollouts must land in the requested bin"
     data = dict(positions=ro["positions"], actions=ro["actions"], length=ro["length"])
     tokens = tok.with_mode(tok.encode_body(data["positions"], data["actions"], data["length"]), np.maximum(bins, 0))
     tokens[~r, 0] = tok.mode(None)
     T = maze.T
     alive = np.arange(T + 1)[None] <= ro["length"][:, None]
-    value = np.where(alive[..., None], gt.h[np.arange(T + 1)[None], ro["positions"]], 0.0)
+    value = np.where(alive[..., None], gt0.h[np.arange(T + 1)[None], ro["positions"]], 0.0)   # categorical
     out = dict(tokens=tokens.astype(np.int16), setting=setting, setting_names=np.array(names), mode_bin=bins,
+               cond=np.array(cond),
                positions=ro["positions"].astype(np.int16), actions=ro["actions"].astype(np.int8),
                length=ro["length"].astype(np.int16), reached=ro["reached"],
                act_probs=ro["act_probs"].astype(np.float32), value=value.astype(np.float32),

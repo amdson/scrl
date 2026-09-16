@@ -23,8 +23,15 @@ N_TYPES = 3
 
 
 class Tokenizer:
-    def __init__(self, maze: Maze):
-        self.maze = maze
+    def __init__(self, maze: Maze, cond: str = "bin"):
+        """cond: what a reward-bin MODE token k asserts. "bin": the outcome landed in bin k (the original).
+        "threshold": the outcome was bin k OR FASTER (arrived within bin k's window) -- nested events, so a row
+        that achieved bin b is a valid conditioned sample for every k <= b, and the event's probability is the
+        tail sum of the categorical value head. Token ids are identical under both; only the semantics
+        (which rows carry which token, and how the value head is read for a query) change."""
+        if cond not in ("bin", "threshold"):
+            raise ValueError(f"cond={cond!r} not in bin|threshold")
+        self.maze, self.cond = maze, cond
         self.T, self.K, self.H, self.W = maze.T, maze.K, maze.H, maze.W
         self.ACT0 = 0
         self.POS = N_ACTIONS

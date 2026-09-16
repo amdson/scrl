@@ -44,6 +44,19 @@ A `cons_sampler(params, rng, n, step)` for `train()`:
 - existing: cond_gap / info_gain collapse checks, enrichment vs the exact ceiling, goalward when asking
   for the best bin, real-maze return from far starts
 
+## Threshold conditioning -- DONE (`Tokenizer(maze, cond="threshold")`, `train(cond=...)`)
+
+Reward token k now means "bin k or faster" (nested events) instead of "landed in bin k". Mechanics: the
+conditioned half of each batch and the recorded-query consistency batch draw (row, satisfied threshold) pairs
+uniformly (`consistency.threshold_pairs`), so P(row | k) is exactly the data conditioned on the event; the
+identity's value term is the tail sum of the categorical head (`consistency.event_logprob`); the model, the
+NOR half and the MC target are unchanged. Evaluation uses `dp.event_ground_truth` (tail sums, event policy);
+the test set is built with `cond=` at its own path; enrichment's "fail" reference becomes NOR. Verified: the
+exact model scores ~1e-15 on every consistency loss under threshold queries, including non-tightest ones.
+Both notebooks take `COND`. Motivation: bins were parallel in the consistency update, interacting only through
+softmax competition; thresholds share data and value mass across adjacent bins by construction.
+`writeup/math.tex` still describes bin conditioning; it needs a paragraph on events.
+
 ## Next run: `colab/late_rollouts.ipynb`
 
 Offline phase first, then model-proposed queries switched on at `START_LATE` (hypothesis: a longer offline
