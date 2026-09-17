@@ -225,3 +225,141 @@ def conditioned_rollouts(params, action_logits, tok, maze, gt, seed=0, n_per_sta
                 reached=ro["reached"].astype(bool), length=ro["length"].astype(np.int64),
                 norm_return=ro["returns"] / maze.R_opt(S), got_request=(ach >= reqs) & (reqs >= 0),
                 p_request_rw=p_req)
+
+
+# ---- world-model probes (colab/world_model_probe.ipynb) -------------------------------------------------------
+
+def start_values(fwd, params, tok, maze, gt, chunk=64):
+    """The NOR value head at prefix 0 (only the start cell is visible) against the exact random walk, for every
+    start cell. Expected reward uses the same bin representatives on both sides, so binning cancels:
+        model_R  = sum_k q_0(k) r_k              exact_R_binned = sum_k h[0, s, k] r_k
+        exact_R  = E[gamma^tau] under the random walk, unbinned (a plain DP; reference only)
+        err      = model_R - exact_R_binned      log_ratio = log(model_R / exact_R_binned)
+    Returns per-start arrays plus q [S, K] and h0 [S, K]."""
+    S = np.asarray(maze.start_cells)
+    T = maze.T
+    d = dict(positions=np.repeat(S[:, None], T + 1, 1).astype(np.int32), actions=np.zeros((len(S), T), np.int8),
+             length=np.zeros(len(S), np.int64))
+    x = tok.encode(d, R_bin=None)
+    q = np.exp(_log_softmax(_fwd_chunks(fwd, params, x, "v_logits", chunk)[:, 0]))       # [S, K]
+    h0 = gt.h[0][S]
+    r = maze.bin_reward
+    V = np.zeros((T + 1, maze.n_cells)); V[:, maze.goal] = 1.0
+    for t in range(T - 1, -1, -1):
+        V[t] = np.where(gt.is_goal, 1.0, maze.gamma * V[t + 1][maze.next_open].mean(1))
+    model_R, exact_b = q @ r, h0 @ r
+    return dict(cell=S, dist=maze.dist[S].astype(np.int64), model_R=model_R, exact_R_binned=exact_b,
+                exact_R=V[0][S], err=model_R - exact_b, log_ratio=np.log(model_R) - np.log(exact_b), q=q, h0=h0)
+
+
+def imagined_transitions(params, state_logits, cell_logits, tok, maze, d, n=2000, seed=0, max_steps=10,
+                         modes=(None,), bucket=64):
+    """Imagined rollouts (model actions, model dynamics, model END) from random recorded prefixes; every imagined
+    transition is checked against the real maze. A prefix is a random dataset row cut at a uniform tau < length.
+
+    Returns one record per imagined step (dict of flat arrays): mode (-1 = NOR), tau, depth (1 = first imagined
+    step), cell, action, pred (predicted next cell), real (next_open[cell, action]), ok, and kind:
+        0 ok   1 wrong_dir (stayed or moved to an open neighbour that is not where the action leads)
+        2 wall (predicted cell is a wall)   3 teleport (an open cell that is not the cell or its neighbour)
+    plus per-rollout arrays under "rows": mode, tau, n_steps, any_bad, ended (END emitted)."""
+    from .env import WALL
+    from .evaluate import continue_rollout
+    rng = np.random.default_rng(seed)
+    L = d["length"].astype(np.int64)
+    idx = rng.integers(0, len(L), n)
+    tau = (rng.random(n) * L[idx]).astype(np.int64)                    # uniform in [0, length)
+    pos_src, act_src = d["positions"][idx], d["actions"][idx]
+    is_wall = maze.grid.reshape(-1) == WALL
+    steps, rows = {k: [] for k in ("mode", "tau", "depth", "cell", "action", "pred", "real", "ok", "kind")}, \
+                  {k: [] for k in ("mode", "tau", "n_steps", "any_bad", "ended")}
+    t = np.arange(maze.T)[None]
+    for mode in modes:
+        m = -1 if mode is None else int(mode)
+        ro = continue_rollout(params, state_logits, tok, maze, pos_src, act_src, tau, np.full(n, m), rng,
+                              cell_logits=cell_logits, learned_end=True, max_steps=max_steps, bucket=bucket)
+        pos, act, length = ro["positions"].astype(np.int64), ro["actions"].astype(np.int64), ro["length"].astype(np.int64)
+        active = (t >= tau[:, None]) & (t < length[:, None])
+        r, c = np.nonzero(active)
+        cell, a, pred = pos[r, c], act[r, c], pos[r, c + 1]
+        real = maze.next_open[cell, a]
+        nb = maze.next_open[cell]                                                        # [n, 4]
+        adjacent = (pred == cell) | (nb == pred[:, None]).any(-1)
+        kind = np.where(pred == real, 0, np.where(is_wall[pred], 2, np.where(adjacent, 1, 3)))
+        for k, v in zip(steps, (np.full(len(r), m), tau[r], c - tau[r] + 1, cell, a, pred, real, kind == 0, kind)):
+            steps[k].append(v)
+        bad = (kind > 0)
+        any_bad = np.zeros(n, bool); np.add.at(any_bad, r, bad)
+        for k, v in zip(rows, (np.full(n, m), tau, active.sum(1), any_bad, ro["reached"].astype(bool))):
+            rows[k].append(v)
+    out = {k: np.concatenate(v) for k, v in steps.items()}
+    out["rows"] = {k: np.concatenate(v) for k, v in rows.items()}
+    out["kind_names"] = ("ok", "wrong_dir", "wall", "teleport")
+    return out
+
+
+# ---- world-model probes (colab/world_model_probe.ipynb) -------------------------------------------------------
+
+def start_values(fwd, params, tok, maze, gt, chunk=64):
+    """The NOR value head at prefix 0 (only the start cell is visible) against the exact random walk, for every
+    start cell. Expected reward uses the same bin representatives on both sides, so binning cancels:
+        model_R  = sum_k q_0(k) r_k              exact_R_binned = sum_k h[0, s, k] r_k
+        exact_R  = E[gamma^tau] under the random walk, unbinned (a plain DP; reference only)
+        err      = model_R - exact_R_binned      log_ratio = log(model_R / exact_R_binned)
+    Returns per-start arrays plus q [S, K] and h0 [S, K]."""
+    S = np.asarray(maze.start_cells)
+    T = maze.T
+    d = dict(positions=np.repeat(S[:, None], T + 1, 1).astype(np.int32), actions=np.zeros((len(S), T), np.int8),
+             length=np.zeros(len(S), np.int64))
+    x = tok.encode(d, R_bin=None)
+    q = np.exp(_log_softmax(_fwd_chunks(fwd, params, x, "v_logits", chunk)[:, 0]))       # [S, K]
+    h0 = gt.h[0][S]
+    r = maze.bin_reward
+    V = np.zeros((T + 1, maze.n_cells)); V[:, maze.goal] = 1.0
+    for t in range(T - 1, -1, -1):
+        V[t] = np.where(gt.is_goal, 1.0, maze.gamma * V[t + 1][maze.next_open].mean(1))
+    model_R, exact_b = q @ r, h0 @ r
+    return dict(cell=S, dist=maze.dist[S].astype(np.int64), model_R=model_R, exact_R_binned=exact_b,
+                exact_R=V[0][S], err=model_R - exact_b, log_ratio=np.log(model_R) - np.log(exact_b), q=q, h0=h0)
+
+
+def imagined_transitions(params, state_logits, cell_logits, tok, maze, d, n=2000, seed=0, max_steps=10,
+                         modes=(None,), bucket=64):
+    """Imagined rollouts (model actions, model dynamics, model END) from random recorded prefixes; every imagined
+    transition is checked against the real maze. A prefix is a random dataset row cut at a uniform tau < length.
+
+    Returns one record per imagined step (dict of flat arrays): mode (-1 = NOR), tau, depth (1 = first imagined
+    step), cell, action, pred (predicted next cell), real (next_open[cell, action]), ok, and kind:
+        0 ok   1 wrong_dir (stayed or moved to an open neighbour that is not where the action leads)
+        2 wall (predicted cell is a wall)   3 teleport (an open cell that is not the cell or its neighbour)
+    plus per-rollout arrays under "rows": mode, tau, n_steps, any_bad, ended (END emitted)."""
+    from .env import WALL
+    from .evaluate import continue_rollout
+    rng = np.random.default_rng(seed)
+    L = d["length"].astype(np.int64)
+    idx = rng.integers(0, len(L), n)
+    tau = (rng.random(n) * L[idx]).astype(np.int64)                    # uniform in [0, length)
+    pos_src, act_src = d["positions"][idx], d["actions"][idx]
+    is_wall = maze.grid.reshape(-1) == WALL
+    steps = {k: [] for k in ("mode", "tau", "depth", "cell", "action", "pred", "real", "ok", "kind")}
+    rows = {k: [] for k in ("mode", "tau", "n_steps", "any_bad", "ended")}
+    t = np.arange(maze.T)[None]
+    for mode in modes:
+        m = -1 if mode is None else int(mode)
+        ro = continue_rollout(params, state_logits, tok, maze, pos_src, act_src, tau, np.full(n, m), rng,
+                              cell_logits=cell_logits, learned_end=True, max_steps=max_steps, bucket=bucket)
+        pos, act, length = ro["positions"].astype(np.int64), ro["actions"].astype(np.int64), ro["length"].astype(np.int64)
+        active = (t >= tau[:, None]) & (t < length[:, None])
+        r, c = np.nonzero(active)
+        cell, a, pred = pos[r, c], act[r, c], pos[r, c + 1]
+        real = maze.next_open[cell, a]
+        adjacent = (pred == cell) | (maze.next_open[cell] == pred[:, None]).any(-1)
+        kind = np.where(pred == real, 0, np.where(is_wall[pred], 2, np.where(adjacent, 1, 3)))
+        for k, v in zip(steps, (np.full(len(r), m), tau[r], c - tau[r] + 1, cell, a, pred, real, kind == 0, kind)):
+            steps[k].append(v)
+        any_bad = np.zeros(n, bool); np.logical_or.at(any_bad, r, kind > 0)
+        for k, v in zip(rows, (np.full(n, m), tau, active.sum(1), any_bad, ro["reached"].astype(bool))):
+            rows[k].append(v)
+    out = {k: np.concatenate(v) for k, v in steps.items()}
+    out["rows"] = {k: np.concatenate(v) for k, v in rows.items()}
+    out["kind_names"] = ("ok", "wrong_dir", "wall", "teleport")
+    return out
