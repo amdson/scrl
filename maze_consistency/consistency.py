@@ -45,20 +45,28 @@ from .env import N_ACTIONS as N_ACTIONS_
 
 # ---- residuals ---------------------------------------------------------------------------------
 
-def residuals(u, v, b, lengths):
+def residuals(u, v, b, lengths, starts=None):
     """u, v [B, N]; b [B, N+1]; lengths [B] (env steps per rollout, >= 1). All arrays float.
 
-    Returns delta [B, N], c [B, N+1], and the masks/lengths the losses need. Entries past a rollout's own
-    length are zeroed before any arithmetic, so c is flat (not repeating) outside the valid range."""
+    starts [B] (default 0): the first block of each row that counts. Blocks t < starts are context only --
+    their delta is zeroed, so c is 0 up to the start prefix and every interval the losses see lies inside
+    [starts, lengths]. Proposal rows (make_rollout_sampler) use this to enforce the identity on their imagined
+    segment alone: with the variance shortcut the weight of step t is ~ t (n - t), so appending ten imagined
+    steps to a long recorded prefix would otherwise leave them the least-weighted part of the row.
+
+    Returns delta [B, N], c [B, N+1], and the masks/lengths the losses need. Entries outside a row's own
+    range are zeroed before any arithmetic, so c is flat (not repeating) there."""
     u, v, b = (jnp.asarray(z, jnp.float32) for z in (u, v, b))
     B, N = u.shape
     lengths = jnp.asarray(lengths, jnp.int32)
-    edge = jnp.arange(N)[None, :] < lengths[:, None]            # blocks t = 1..n
-    node = jnp.arange(N + 1)[None, :] <= lengths[:, None]       # prefixes h_0..h_n
+    starts = jnp.zeros_like(lengths) if starts is None else jnp.asarray(starts, jnp.int32)
+    t = jnp.arange(N)[None, :]
+    edge = (t >= starts[:, None]) & (t < lengths[:, None])                   # blocks t = s+1..n
+    node = (jnp.arange(N + 1)[None, :] >= starts[:, None]) & (jnp.arange(N + 1)[None, :] <= lengths[:, None])
     delta = jnp.where(edge, v - u + b[:, :-1] - b[:, 1:], 0.0)
     c = jnp.concatenate([jnp.zeros((B, 1), delta.dtype), jnp.cumsum(delta, -1)], -1)
     return dict(delta=delta, c=jnp.where(node, c, 0.0), edge=edge, node=node,
-                lengths=lengths, n=lengths.astype(jnp.float32))
+                lengths=lengths, starts=starts, n=(lengths - starts).astype(jnp.float32))
 
 
 # ---- losses (per rollout, shape [B]) -----------------------------------------------------------
@@ -92,7 +100,10 @@ def poly_loss(r, coefs=(1.0,)):
 
     coefs=(1.0,) is all_intervals_loss; coefs=(0.0, 1.0) weights each interval by its length, which tilts the
     objective toward long-range drift without going all the way to the multiscale machinery."""
-    c, node, n = r["c"], r["node"], r["lengths"]
+    c, node, n = r["c"], r["node"], r["lengths"] - r["starts"]
+    if "starts" in r:                                    # the prefix sums index from 0: shift each row to its start
+        c = jax.vmap(lambda row, s: jnp.roll(row, -s))(c, r["starts"])
+        node = jax.vmap(lambda row, s: jnp.roll(row, -s))(node, r["starts"])
     B, M = c.shape
     f = c.dtype
     k = jnp.arange(M, dtype=f)
@@ -120,7 +131,7 @@ def poly_loss(r, coefs=(1.0,)):
 def multiscale_loss(r, divide_by_length=True, add_full=False):
     """Equal weight per power-of-two length; each squared interval residual optionally divided by its length
     (which equalizes them under the same iid heuristic). O(n log n)."""
-    c, lengths = r["c"], r["lengths"]
+    c, lengths, starts = r["c"], r["lengths"], r["starts"]
     B, M = c.shape
     N = M - 1
     lens = [1]
@@ -131,7 +142,8 @@ def multiscale_loss(r, divide_by_length=True, add_full=False):
     total = jnp.zeros(B, c.dtype)
     count = jnp.zeros(B, c.dtype)
     for ell in lens:
-        valid = (jnp.arange(M - ell)[None, :] + ell) <= lengths[:, None]
+        i = jnp.arange(M - ell)[None, :]
+        valid = ((i + ell) <= lengths[:, None]) & (i >= starts[:, None])
         diff = jnp.where(valid, c[:, ell:] - c[:, :-ell], 0.0)
         terms = valid.sum(-1).astype(c.dtype)
         per = (diff ** 2).sum(-1) / jnp.maximum(terms, 1.0) / (ell if divide_by_length else 1.0)
@@ -164,10 +176,11 @@ def diagnostics(r, u, v, b):
     edge, node, n = r["edge"], r["node"], r["n"]
     u, v, b = (jnp.asarray(z, jnp.float32) for z in (u, v, b))
     last = jnp.take_along_axis(b, r["lengths"][:, None], 1)[:, 0]
+    first = jnp.take_along_axis(b, r["starts"][:, None], 1)[:, 0]     # belief at the row's start prefix
     return dict(
-        info_gain=last - b[:, 0],                                       # log q_n(R) - log q_0(R), should grow
+        info_gain=last - first,                                         # log q_n(R) - log q_s(R), should grow
         cond_gap=(jnp.abs(v - u) * edge).sum(-1) / n,                   # mean |v_t - u_t|, R changing the policy
-        b_first=b[:, 0], b_last=last,
+        b_first=first, b_last=last,
         drift=r["c"][jnp.arange(b.shape[0]), r["lengths"]] / n,         # mean signed residual = c_n / n
         rms_delta=jnp.sqrt((r["delta"] ** 2).sum(-1) / n),
     )
@@ -289,8 +302,9 @@ def rollout_batch(tok, maze, d, idx, R_bin=None):
     R_bin = np.asarray(R_bin).astype(np.int32)
     x_nor, x_R = tok.with_mode(body, None), tok.with_mode(body, R_bin)
     targets, _ = tok.next_targets(x_nor)
-    return dict(x_nor=x_nor, x_R=x_R, targets=targets, R_bin=R_bin,
-                lengths=d["length"][idx].astype(np.int32))
+    lengths = d["length"][idx].astype(np.int32)
+    return dict(x_nor=x_nor, x_R=x_R, targets=targets, R_bin=R_bin, lengths=lengths,
+                starts=np.zeros_like(lengths))
 
 
 def make_tilted_sampler(model, tok, maze, d, n_train, beta, floor=0.0, truncate=False):
@@ -328,7 +342,8 @@ def make_tilted_sampler(model, tok, maze, d, n_train, beta, floor=0.0, truncate=
         sampler.history.append(dict(step=int(step), beta=b, bins=np.bincount(R_bin, minlength=maze.K),
                                     n_cut=n_cut, mean_used=float(lengths.mean())))
         targets, _ = tok.next_targets(x_nor)
-        return dict(x_nor=x_nor, x_R=tok.with_mode(body, R_bin), targets=targets, R_bin=R_bin, lengths=lengths)
+        return dict(x_nor=x_nor, x_R=tok.with_mode(body, R_bin), targets=targets, R_bin=R_bin, lengths=lengths,
+                    starts=np.zeros_like(lengths))
 
     sampler.history = []
     return sampler
@@ -354,65 +369,82 @@ def make_belief_truncation(model, tok, floor):
     return truncate
 
 
-def make_rollout_sampler(model, tok, maze, d, n_train, request="highest", beta=0.0, buffer_n=128,
-                         refresh_every=250, tau_max=0, floor=0.0, max_steps=None):
+def make_rollout_sampler(model, tok, maze, d, n_train, request="quantile", p=0.1, beta=0.0, buffer_n=256,
+                         refresh_every=250, max_steps=10):
     """A cons_sampler whose rows are the model's own reward-conditioned rollouts, used ONLY as places to
-    enforce the identity (math.tex section 3). Nothing is relabelled and nothing is fitted.
+    enforce the identity (writeup/rollout_plan.md section 3). Nothing is relabelled and nothing is fitted.
 
-    From a recorded prefix h_tau (tau ~ U{0..tau_max}), actions come from the conditioned policy under the
-    request, next cells from the NOR dynamics head, and the rollout ends when the model emits END. The
-    query bin for the residual is the request itself. request="highest" asks for K-1; request="tilt" draws
-    it from the model's reward prediction at the start prefix tilted by exp(beta r_k), as make_tilted_sampler.
-    With floor > 0 each row's intervals stop where the model's belief in the query bin falls below the floor.
-    max_steps truncates every rollout after that many imagined steps: the identity needs no terminal, short
-    rollouts stay inside the query's plausible window, and generation costs max_steps calls instead of up to T.
-    Because the floor cuts a row at its first below-floor prefix, put the imagined steps first (tau_max=0).
-    No maze structure is used anywhere. sampler.history records per-refresh readouts."""
+    Each row: a recorded prefix h_tau with tau ~ U[0, length); a request c read off the NOR value head at that
+    prefix; at most max_steps imagined steps with actions from the conditioned policy under c, next cells
+    from the NOR dynamics head and the model's own END; the residual under query c on the imagined segment
+    only (starts = tau, see residuals). No filtering and no belief floor: every row is kept whole.
+
+    request="quantile": c is the largest threshold k >= 1 whose tail belief q_tau(k) is at least p -- the most
+    ambitious event the model still gives probability p, so a near-goal prefix asks for a fast arrival and a
+    far prefix for what it can still believe in. p is a float or a callable(step); lowering it over training
+    is the schedule. request="tilt": c ~ q_tau(k) exp(beta r_k) (make_tilted_sampler; one beta for every
+    prefix). request="highest": K-1 everywhere (the arm of rollout_plan.md section 7).
+
+    No maze structure is used anywhere. sampler.history records per-refresh readouts (request histogram,
+    prefix and endpoint log-beliefs in the request, their ratio, tau, END rate); sampler.last_rollout() hands
+    the raw buffer to evaluation-only checks such as evaluate.imagined_rollout_eval."""
     from .evaluate import make_state_logits, make_cell_logits, continue_rollout
-    if request not in ("highest", "tilt"):
-        raise ValueError("request must be 'highest' or 'tilt'")
+    from .model import make_forward
+    if request not in ("quantile", "tilt", "highest"):
+        raise ValueError("request must be 'quantile', 'tilt' or 'highest'")
     state_logits, cell_logits = make_state_logits(model, tok), make_cell_logits(model, tok)
-    types2 = jnp.asarray(tok.types[:2])
+    fwd = make_forward(model, tok)
     r_k = np.asarray(maze.bin_reward, dtype=np.float64)
-    truncate = make_belief_truncation(model, tok, floor) if floor > 0 else None
+    T = maze.T
 
-    @jax.jit
-    def q0_logits(params, x2):
-        return model.apply({"params": params}, x2, types2)["value"][:, 1]
+    def beliefs(params, x_nor):
+        """NOR value head at every prefix of x_nor, log-softmaxed: [B, T+1, K]."""
+        return _log_softmax_np(np.asarray(fwd(params, jnp.asarray(x_nor))["v_logits"]).astype(np.float64))
 
     state = {"buf": None, "last": -10**9}
 
     def refresh(params, rng, step):
         idx = rng.integers(0, n_train, buffer_n)
         L = d["length"][idx].astype(np.int64)
-        tau = np.minimum(rng.integers(0, tau_max + 1, buffer_n), L - 1)
+        tau = (rng.random(buffer_n) * L).astype(np.int64)                       # uniform in [0, L)
+        prefix = tok.with_mode(tok.encode_body(d["positions"][idx], d["actions"][idx], tau), None)
+        logq_tau = beliefs(params, prefix)[np.arange(buffer_n), tau]           # belief at the prefix, [B, K]
+        knob = None
         if request == "highest":
             req = np.full(buffer_n, maze.K - 1, np.int32)
+        elif request == "tilt":
+            knob = beta(step) if callable(beta) else float(beta)
+            req = _tilted_query(logq_tau, knob, r_k, 0.0, tok, rng)
         else:
-            body = tok.encode_body(d["positions"][idx], d["actions"][idx], L)
-            logq = _log_softmax_np(np.asarray(q0_logits(params, jnp.asarray(tok.with_mode(body, None)[:, :2]))).astype(np.float64))
-            b = beta(step) if callable(beta) else float(beta)
-            req = _tilted_query(logq, b, r_k, floor, tok, rng)
+            knob = p(step) if callable(p) else float(p)
+            req = _quantile_query(logq_tau, knob, tok)
         ro = continue_rollout(params, state_logits, tok, maze, d["positions"][idx], d["actions"][idx], tau, req, rng,
                               cell_logits=cell_logits, learned_end=True, max_steps=max_steps)
-        keep = ro["length"].astype(np.int64) > tau            # a rollout that emitted END at once has no
-        if keep.sum() < 2:                                      # transitions: nothing to enforce, and n = 0 would
-            keep[:] = True                                      # divide the per-row loss by zero
+        length = ro["length"].astype(np.int64)
+        keep = length > tau                                     # END at once: no imagined step, nothing to enforce
+        if keep.sum() < 2:
+            keep[:] = True
+            length = np.maximum(length, tau + 1)
         x = ro["x"][keep]
-        req = req[keep]
         x_nor = tok.with_mode(x, None)
-        lengths = np.maximum(ro["length"][keep].astype(np.int32), 1)
-        n_cut = 0
-        if truncate is not None:
-            lengths, n_cut = truncate(params, x_nor, req, lengths)
+        lengths, starts, req_k = length[keep].astype(np.int32), tau[keep].astype(np.int32), req[keep].astype(np.int32)
         targets, _ = tok.next_targets(x_nor)
-        state["buf"] = dict(x_nor=x_nor, x_R=tok.with_mode(x, req), targets=targets, R_bin=req.astype(np.int32),
-                            lengths=lengths)
+        state["buf"] = dict(x_nor=x_nor, x_R=tok.with_mode(x, req_k), targets=targets, R_bin=req_k,
+                            lengths=lengths, starts=starts)
         state["n_buf"] = len(lengths)
         state["ro"], state["tau"], state["ro_step"] = ro, tau, int(step)   # for evaluate.imagined_rollout_eval only
-        sampler.history.append(dict(step=int(step), ended=float(ro["reached"].mean()),
-                                    mean_len=float(ro["length"].mean()), mean_used=float(lengths.mean()),
-                                    n_cut=n_cut, n_empty=int((~keep).sum()), bins=np.bincount(req, minlength=maze.K)))
+        # readouts: the model's belief in the request at the prefix and at the endpoint (one NOR forward)
+        lq = beliefs(params, x_nor)
+        lb = event_logprob_np(lq, req_k[:, None], tok.cond, tok.K)                   # [B, T+1]
+        lb_prefix, lb_end = lb[np.arange(len(lengths)), starts], lb[np.arange(len(lengths)), lengths]
+        state["readout"] = dict(lb_prefix=lb_prefix, lb_end=lb_end, req=req_k, tau=starts,
+                                n_imagined=lengths - starts, keep=keep)
+        sampler.history.append(dict(step=int(step), knob=knob, bins=np.bincount(req, minlength=maze.K),
+                                    ended=float(ro["reached"].mean()), mean_imagined=float((lengths - starts).mean()),
+                                    mean_tau=float(tau.mean()), n_empty=int((~keep).sum()),
+                                    lb_prefix=float(lb_prefix.mean()), lb_end=float(lb_end.mean()),
+                                    ratio=float((lb_end - lb_prefix).mean()),
+                                    frac_flat=float((np.abs(lb_end - lb_prefix) < 1.0).mean())))
 
     def sampler(params, rng, n, step):
         if step - state["last"] >= refresh_every:
@@ -423,6 +455,7 @@ def make_rollout_sampler(model, tok, maze, d, n_train, request="highest", beta=0
 
     sampler.history = []
     sampler.last_rollout = lambda: (state["ro"], state["tau"], state["ro_step"])
+    sampler.last_readout = lambda: state["readout"]
     return sampler
 
 
@@ -481,6 +514,20 @@ def _tilted_query(logq, beta, r_k, floor, tok, rng):
     return np.minimum((rng.random(len(p))[:, None] > p.cumsum(-1)).sum(-1), K - 1).astype(np.int32)
 
 
+def _quantile_query(logq, p, tok):
+    """The most ambitious event the model still believes with probability >= p: per row, the largest k >= 1
+    whose belief (categorical for cond="bin", tail sum for cond="threshold") is at least p. Under thresholds
+    the tail is non-increasing in k, so this is one quantile of the value head. Rows with no such k fall back
+    to k = 1 (the weakest event) under thresholds and to the argmax bin under cond="bin"."""
+    K = tok.K
+    logb = event_logprob_np(logq[:, None, :], np.arange(K)[None, :], tok.cond, K)     # [n, K]
+    ok = logb >= np.log(p)
+    ok[:, 0] = False
+    largest = K - 1 - ok[:, ::-1].argmax(-1)
+    fallback = np.ones(len(logb), np.int64) if tok.cond == "threshold" else logb.argmax(-1)
+    return np.where(ok.any(-1), largest, fallback).astype(np.int32)
+
+
 def data_nll(lp, mask):
     """Teacher-forced next-token loss from gathered log probs, matching model.next_token_loss."""
     m = mask.astype(lp.dtype)
@@ -490,7 +537,7 @@ def data_nll(lp, mask):
 def evaluate(params, terms_fn, batch):
     """One batch end to end: model terms -> residuals -> every loss + diagnostics. All values per rollout."""
     t = terms_fn(params, *(jnp.asarray(batch[k]) for k in ("x_nor", "x_R", "targets", "R_bin")))
-    r = residuals(t["u"], t["v"], t["b"], batch["lengths"])
+    r = residuals(t["u"], t["v"], t["b"], batch["lengths"], batch.get("starts"))
     return t, r, all_losses(r), diagnostics(r, t["u"], t["v"], t["b"])
 
 

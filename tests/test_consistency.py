@@ -224,3 +224,39 @@ if __name__ == "__main__":
         if k.startswith("test_"):
             v()
             print("ok", k)
+
+
+def test_starts_restrict_to_the_imagined_segment():
+    """residuals(..., starts) on a row equals residuals on the sub-row [start, length] shifted to index 0, for
+    every loss and the diagnostics: the prefix before `starts` is context only."""
+    u, v, b = _fake()
+    lengths, starts = np.array([4, 6, 12, 9, 12, 5]), np.array([0, 2, 5, 3, 11, 4])
+    r = C.residuals(u, v, b, lengths, starts)
+    losses = C.all_losses(r)
+    dg = C.diagnostics(r, u, v, b)
+    for row, (n, s) in enumerate(zip(lengths, starts)):
+        u2, v2, b2 = np.zeros((1, N)), np.zeros((1, N)), np.zeros((1, N + 1))
+        u2[0, : n - s], v2[0, : n - s], b2[0, : n - s + 1] = u[row, s:n], v[row, s:n], b[row, s : n + 1]
+        r2 = C.residuals(u2, v2, b2, np.array([n - s]))
+        for k, val in C.all_losses(r2).items():
+            assert np.isclose(float(losses[k][row]), float(val[0]), rtol=1e-4, atol=1e-5), (k, row)
+        dg2 = C.diagnostics(r2, u2, v2, b2)
+        for k in ("info_gain", "cond_gap", "drift", "rms_delta"):
+            assert np.isclose(float(dg[k][row]), float(dg2[k][0]), rtol=1e-4, atol=1e-5), (k, row)
+    # the context blocks carry no gradient
+    g = jax.grad(lambda U: C.all_intervals_loss(C.residuals(U, v, b, lengths, starts)).sum())(jnp.asarray(u))
+    assert np.allclose(np.asarray(g)[np.arange(N)[None, :] < starts[:, None]], 0.0)
+
+
+def test_quantile_query_is_the_most_ambitious_believed_threshold():
+    tok = Tokenizer(M, cond="threshold")
+    K = tok.K
+    q = np.full((3, K), 1e-6)
+    q[0, [1, 2, 3]] = [0.5, 0.3, 0.15]          # tails: k=1 ~.95, k=2 ~.45, k=3 ~.15, k=4 ~1e-5
+    q[1, 0] = 1.0                                # nothing believed: falls back to k = 1
+    q[2, K - 1] = 1.0                            # everything in the top bin: asks for K-1
+    logq = np.log(q / q.sum(-1, keepdims=True))
+    assert C._quantile_query(logq, 0.1, tok).tolist() == [3, 1, K - 1]
+    assert C._quantile_query(logq, 0.4, tok).tolist() == [2, 1, K - 1]
+    assert C._quantile_query(logq, 1e-4, tok).tolist() == [3, 1, K - 1]
+    assert C._quantile_query(logq, 1e-7, tok).tolist() == [K - 1, K - 1, K - 1]

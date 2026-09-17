@@ -53,6 +53,8 @@ class LossConfig:
     cons_loss: str = "all_scaled"   # which objective: any key of consistency.ALL
     w_cons: float = 0.1       # lambda_cons
     cons_batch: int = 16      # rollouts per step; each costs two forward passes (NOR and R)
+    w_prop: float = -1.0      # lambda_prop: weight of the PROPOSAL rows of a consistency batch (those after the
+                              # sampler's n_rec recorded rows); negative = the same as w_cons
     cons_warmup: float = 0.0  # fraction of training before the consistency term switches on
     cons_detach: str = "none"  # stop-gradient inside the consistency term: none | b | uv | u
                                #   b  : the value head is a fixed teacher; only the token heads move
@@ -64,6 +66,10 @@ class LossConfig:
     @property
     def main_value(self) -> bool:
         return self.mc or self.td
+
+    @property
+    def w_proposal(self) -> float:
+        return self.w_cons if self.w_prop < 0 else self.w_prop
 
     def __post_init__(self):
         if self.cons and self.cons_loss not in C.ALL:
@@ -113,7 +119,10 @@ def make_step(model, tok: Tokenizer, opt, lc: LossConfig):
     terms = C.make_terms_fn(model, tok, jit=False) if lc.cons else None
 
     def cons_term(p, nb):
-        """lambda_cons * L_cons on its own batch, both modes on the same rollouts."""
+        """The weighted consistency term on its own batch, both modes on the same rollouts: the first
+        nb["n_rec"] rows (all rows when absent) are recorded rows at weight w_cons, the rest proposal rows at
+        w_proposal. Returns (weighted term, parts): `cons` is the unweighted per-row mean as before, cons_rec
+        and cons_prop the two halves' means."""
         t = terms(p, nb["x_nor"], nb["x_R"], nb["targets"], nb["R_bin"])
         u, v, b = t["u"], t["v"], t["b"]
         if lc.cons_detach == "b":                 # value head as a fixed teacher
@@ -122,12 +131,17 @@ def make_step(model, tok: Tokenizer, opt, lc: LossConfig):
             u, v = sg(u), sg(v)
         elif lc.cons_detach == "u":               # only the unconditioned ordering is fixed
             u = sg(u)
-        r = C.residuals(u, v, b, nb["lengths"])
+        r = C.residuals(u, v, b, nb["lengths"], nb["starts"] if "starts" in nb else None)
         dg = C.diagnostics(r, t["u"], t["v"], t["b"])      # diagnostics always read the undetached terms
+        rows = C.ALL[lc.cons_loss](r)
+        B = rows.shape[0]
+        rec = (jnp.arange(B) < (nb["n_rec"] if "n_rec" in nb else B)).astype(jnp.float32)
+        w = rec * lc.w_cons + (1.0 - rec) * lc.w_proposal
+        mean_of = lambda m: (rows * m).sum() / jnp.maximum(m.sum(), 1.0)
         # cond_gap and info_gain are the collapse check: the degenerate optimum of every consistency loss is
         # "ignore R" (v == u, b flat in t), which drives both to 0 while L_cons falls. Logged, never optimized.
-        return C.ALL[lc.cons_loss](r).mean(), dict(cond_gap=dg["cond_gap"].mean(),
-                                                   info_gain=dg["info_gain"].mean())
+        return (rows * w).mean(), dict(cons=rows.mean(), cons_rec=mean_of(rec), cons_prop=mean_of(1.0 - rec),
+                                       cond_gap=dg["cond_gap"].mean(), info_gain=dg["info_gain"].mean())
 
     def loss_fn(p, x, tgt, mask, cb, nb, cons_on):
         out = model.apply({"params": p}, x, types)
@@ -156,9 +170,9 @@ def make_step(model, tok: Tokenizer, opt, lc: LossConfig):
         return add_cons(p, total, parts, nb, cons_on) if lc.cons else (total, parts)
 
     def add_cons(p, total, parts, nb, cons_on):
-        cons, diag = cons_term(p, nb)
-        parts.update(cons=cons, **diag)
-        return total + lc.w_cons * cons_on * cons, parts
+        weighted, diag = cons_term(p, nb)
+        parts.update(cons_w=weighted, **diag)
+        return total + cons_on * weighted, parts
 
     @jax.jit
     def step(params, opt_state, x, tgt, mask, cb, nb, cons_on):
@@ -192,7 +206,8 @@ def make_grad_norms(model, tok: Tokenizer, lc: LossConfig):
 
     def cons_rows(p, nb):
         t = terms(p, nb["x_nor"], nb["x_R"], nb["targets"], nb["R_bin"])
-        return C.ALL[lc.cons_loss](C.residuals(t["u"], t["v"], t["b"], nb["lengths"]))     # per row
+        r = C.residuals(t["u"], t["v"], t["b"], nb["lengths"], nb["starts"] if "starts" in nb else None)
+        return C.ALL[lc.cons_loss](r)     # per row
 
     def cons_masked(p, nb, w):
         return (cons_rows(p, nb) * w).sum() / jnp.maximum(w.sum(), 1.0)
@@ -224,8 +239,8 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
           loss: LossConfig | None = None, consistency=False, a_warmup=None,
           eval_fn=None, eval_every=0, log_every=100, log=print, cons_sampler=None, maze_kw=None,
           mixer=None, mix_frac=0.0, init_params=None, metrics_fn=None, grad_every=0, ckpt_every=0,
-          resume=True, warmup=0, cosine=False, lr_end_frac=0.1, pos_enc="learned", mode_enc="free",
-          cond="bin"):
+          resume=True, warmup=0, cosine=False, lr_end_frac=0.1, pos_enc="rope", mode_enc="ordinal",
+          cond="threshold"):
     """loss: a LossConfig (default: next-token only). consistency=True is shorthand for LossConfig(mc=True, cons=True).
     eval_fn(params, fwd) -> dict of metrics, called at step 0, every eval_every steps, and at the end.
 
@@ -257,7 +272,10 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
     cond: Tokenizer.cond. "threshold" makes a reward token mean "this bin or faster": the conditioned half of
     every batch and the default consistency batch are then (row, satisfied threshold) pairs drawn uniformly
     (consistency.threshold_pairs), and the consistency term reads the value head's tail sum for the query.
-    The NOR half, the MC target and the model are unchanged."""
+    The NOR half, the MC target and the model are unchanged.
+
+    Defaults (threshold conditioning, RoPE, ordinal MODE embedding) are the current best arm; older runs on
+    disk record their own settings in params.pkl and load_run restores them."""
     lc = loss or (LossConfig(mc=True, cons=True) if consistency else LossConfig())
     if a_warmup is not None:
         lc = replace(lc, a_warmup=a_warmup)
@@ -382,7 +400,20 @@ def train(name="tf", steps=2000, batch=32, lr=1e-3, d_model=64, n_layers=2, n_he
     return params, cfg
 
 
-def load_run(name):
+LEGACY_CFG = dict(mode_enc="free", pos_enc="learned")   # what runs saved before these options existed used
+
+
+def load_run(name, meta=False):
+    """(params, ModelConfig) of a finished run; meta=True also returns the rest of params.pkl (loss, cond).
+    Runs saved before an option existed get that option's original value, not ModelConfig's current default."""
     with open(os.path.join(RUNS_DIR, name, "params.pkl"), "rb") as f:
         z = pickle.load(f)
-    return z["params"], ModelConfig(**z["cfg"])
+    cfg = ModelConfig(**dict(LEGACY_CFG, **z["cfg"]))
+    extra = dict(loss=z.get("loss"), cond=z.get("cond", "bin"))
+    return (z["params"], cfg, extra) if meta else (z["params"], cfg)
+
+
+def run_cond(name):
+    """The Tokenizer.cond a finished run was trained with ("bin" for runs that predate the option)."""
+    with open(os.path.join(RUNS_DIR, name, "params.pkl"), "rb") as f:
+        return pickle.load(f).get("cond", "bin")

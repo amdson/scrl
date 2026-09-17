@@ -240,12 +240,22 @@ def imagined_rollout_eval(maze, ro, tau):
     tau, length = np.asarray(tau).astype(np.int64), ro["length"].astype(np.int64)
     t = np.arange(maze.T)[None]
     active = (t >= tau[:, None]) & (t < length[:, None])
-    bad = (pos[:, 1:] != maze.next_open[pos[:, :-1], actions]) & active
+    cur, pred = pos[:, :-1], pos[:, 1:]
+    bad = (pred != maze.next_open[cur, actions]) & active
     n_steps = max(int(active.sum()), 1)
+    # kind of error: the predicted cell is a wall; an open neighbour (or the cell itself) that the action does
+    # not lead to; or an open cell that is not adjacent at all
+    wall = bad & (maze.dist[pred] < 0)
+    adjacent = (pred == cur) | (pred[..., None] == maze.next_open[cur]).any(-1)
+    wrong_dir = bad & ~wall & adjacent
+    teleport = bad & ~wall & ~adjacent
     ended = ro["reached"].astype(bool)
     at_goal = pos[np.arange(len(length)), length] == maze.goal
     return dict(invalid_step_frac=float(bad.sum() / n_steps),
                 invalid_row_frac=float((bad.sum(1) > 0).mean()),
+                wrong_dir_frac=float(wrong_dir.sum() / n_steps),
+                wall_frac=float(wall.sum() / n_steps),
+                teleport_frac=float(teleport.sum() / n_steps),
                 end_at_goal=float(at_goal[ended].mean()) if ended.any() else np.nan,   # END emitted at the goal
                 reached_goal=float((at_goal & ended).mean()),                          # ended, and really there
                 mean_imagined_steps=float(active.sum(1).mean()))

@@ -65,12 +65,12 @@ def main():
         from maze_consistency.dataset import load
         from maze_consistency.tokens import Tokenizer
         from maze_consistency.model import MazeTransformer
-        from maze_consistency.train import load_run, RUNS_DIR
+        from maze_consistency.train import load_run, run_cond, RUNS_DIR
         from maze_consistency import evaluate as E
         name = sys.argv[2] if len(sys.argv) > 2 else "tf"
         n_per = int(sys.argv[3]) if len(sys.argv) > 3 else 64
         maze, d = load()
-        tok = Tokenizer(maze)
+        tok = Tokenizer(maze, cond=run_cond(name))
         params, cfg = load_run(name)
         model = MazeTransformer(cfg)
         table, per_bin, counts = E.mode_metrics(params, model, tok, maze, d)
@@ -92,10 +92,10 @@ def main():
         from maze_consistency.dataset import canonical_maze
         from maze_consistency.tokens import Tokenizer
         from maze_consistency.model import MazeTransformer, make_forward
-        from maze_consistency.train import load_run
+        from maze_consistency.train import load_run, run_cond
         from maze_consistency.value_eval import value_accuracy
         name = sys.argv[2] if len(sys.argv) > 2 else "tf"
-        tok = Tokenizer(canonical_maze())
+        tok = Tokenizer(canonical_maze(), cond=run_cond(name))
         params, cfg = load_run(name)
         per = value_accuracy(params, make_forward(MazeTransformer(cfg), tok), tok)["per_setting"]
         print(f"[{name}] value head E[R] vs exact E[R], every test-set prefix (MODE = NOR); "

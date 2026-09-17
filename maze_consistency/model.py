@@ -28,14 +28,14 @@ class ModelConfig:
     d_model: int = 64
     n_layers: int = 2
     n_heads: int = 4
-    mode_enc: str = "free"     # "free": one free embedding row per reward bin (the original).
+    mode_enc: str = "ordinal"  # "free": one free embedding row per reward bin (the original).
                                # "ordinal": the MODE token for bin k is a linear map of Fourier features of the
                                #   bin's position on the log arrival-time scale (mode_feat[k]), plus a per-bin
                                #   learned residual initialised at zero. Adjacent bins then share by
                                #   construction, and sparse or empty bins interpolate from their neighbours.
     mode0: int = -1            # kind id of bin 0 (Tokenizer.MODE0); NOR keeps its own free embedding
     mode_feat: tuple = ()      # [K] bin positions in [-1, 1] on the log arrival-time scale (bin 0 = never)
-    pos_enc: str = "learned"   # "learned": a free vector per slot index (the original).
+    pos_enc: str = "rope"      # "learned": a free vector per slot index (the original).
                                # "rope": rotary positions inside attention (relative offsets, so "the most recent
                                #   state slot" is one pattern at every position) plus a FIXED sinusoidal absolute
                                #   embedding of the slot index, which is elapsed time -- the value head needs it.

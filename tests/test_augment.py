@@ -166,10 +166,10 @@ def test_train_mixes_rollouts_without_oracles_and_refuses_td():
     with patch("maze_consistency.train.load", return_value=(maze, D)), \
          patch("maze_consistency.augment.summarize", side_effect=lambda _, b: summarize(MAZE, b)):
         train(name=out, steps=3, batch=8, loss=LossConfig(mc=True, cons=True, cons_loss="local", cons_batch=4),
-              mixer=buf, mix_frac=0.5, log=lambda *a: None, **CFG)
+              mixer=buf, mix_frac=0.5, log=lambda *a: None, cond="bin", **CFG)
     assert [h["step"] for h in buf.history] == [1, 3]                                     # refresh schedule
     try:
-        train(name=out, steps=1, loss=LossConfig(td=True), mixer=buf, mix_frac=0.5, log=lambda *a: None, **CFG)
+        train(name=out, steps=1, loss=LossConfig(td=True), mixer=buf, mix_frac=0.5, log=lambda *a: None, cond="bin", **CFG)
     except ValueError:
         pass
     else:
